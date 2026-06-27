@@ -68,7 +68,7 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
   // D3 refs - stable across renders
   const zoomRef = useRef<d3.ZoomBehavior<SVGSVGElement, unknown> | null>(null)
   const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null)
-  const prevNodePositionsRef = useRef<Map<string, { x?: number; y?: number; vx?: number; vy?: number }>>(new Map())
+  const prevNodePositionsRef = useRef<Map<string, { x?: number; y?: number; fx?: number | null; fy?: number | null; vx?: number; vy?: number }>>(new Map())
   const stableOnClickRef = useRef<((node: FunctionNode) => void) | undefined>(undefined)
   stableOnClickRef.current = onNodeClick
 
@@ -109,6 +109,9 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
     // Zoom
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.05, 10])
+      .filter(event => {
+        return !(event.target as Element).closest?.('.node')
+      })
       .on('zoom', (event) => {
         g.attr('transform', event.transform)
       })
@@ -248,11 +251,59 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
 
     // ── Click handler (uses stable ref to avoid effect re-trigger) ──
     nodeMerge.on('click', (_event, d) => {
+      if (didDrag) return
       useGraphStore.getState().setSelectedNode(d.id)
       stableOnClickRef.current?.(d)
     })
 
-    // ── No drag behavior (static layout — no force simulation to drive it) ──
+    // ── Drag behavior (static layout — manual DOM updates, no force simulation) ──
+    let didDrag = false
+    const drag = d3.drag<SVGGElement, SimNode>()
+      .on('start', function(this: SVGGElement, event, d) {
+        didDrag = false
+        d.fx = d.x
+        d.fy = d.y
+        d3.select(this).raise()
+      })
+      .on('drag', function(this: SVGGElement, event, d) {
+        didDrag = true
+        d.fx = event.x
+        d.fy = event.y
+        d.x = event.x
+        d.y = event.y
+
+        // Update node transform
+        d3.select(this).attr('transform', `translate(${d.x},${d.y})`)
+
+        // Update connected edges (only those touching the dragged node)
+        linkContainer.selectAll<SVGLineElement, SimLink>('line')
+          .filter(l => {
+            const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
+            const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
+            return sid === d.id || tid === d.id
+          })
+          .attr('x1', l => {
+            const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
+            return nodeMap.get(sid)?.x ?? 0
+          })
+          .attr('y1', l => {
+            const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
+            return nodeMap.get(sid)?.y ?? 0
+          })
+          .attr('x2', l => {
+            const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
+            return nodeMap.get(tid)?.x ?? 0
+          })
+          .attr('y2', l => {
+            const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
+            return nodeMap.get(tid)?.y ?? 0
+          })
+      })
+      .on('end', function() {
+        // Node stays where user placed it — fx/fy remain set
+      })
+
+    nodeMerge.call(drag)
 
     // ── Static positioning: place directly at circle layout positions ──
     // Position nodes at their circle positions (replaces tick handler)
@@ -269,7 +320,7 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
     // Save positions for stability across data updates
     for (const n of simNodes) {
       if (n.x !== undefined) {
-        prevNodePositionsRef.current.set(n.id, { x: n.x, y: n.y, vx: n.vx, vy: n.vy })
+        prevNodePositionsRef.current.set(n.id, { x: n.x, y: n.y, fx: n.fx, fy: n.fy, vx: n.vx, vy: n.vy })
       }
     }
   }, [nodes, edges, analysisStatus, width, height])

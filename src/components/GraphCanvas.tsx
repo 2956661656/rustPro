@@ -123,7 +123,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     const zoom = d3.zoom<SVGSVGElement, unknown>()
       .scaleExtent([0.05, 10])
       .filter(event => {
-        return !(event.target as Element).closest?.('.node')
+        return !(event.target as Element).closest('.node')
       })
       .on('zoom', (event) => {
         g.attr('transform', event.transform)
@@ -225,6 +225,9 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
     const mode = selectLayoutMode(subgraphNodes.length)
     console.log('[GC] Layout mode:', mode, 'nodes:', subgraphNodes.length)
+
+    // ── Drag-guard flag: prevents click from firing after drag ends ──
+    let didDrag = false
 
     // ── Build sim data with layout-specific positions ──
     let simNodes: SimNode[]
@@ -482,6 +485,8 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
     // ── Click handler ──
     nodeMerge.on('click', (_event, d) => {
+      if (didDrag) return  // skip click events that follow a drag
+
       // Cancel in-flight edge request before dispatching new focus
       if (d.id !== focusNodeId) {
         setIsLoadingEdges(false)
@@ -497,6 +502,59 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
     // Set initial positions immediately (before simulation starts)
     nodeMerge.attr('transform', d => `translate(${d.x},${d.y})`)
+
+    // ── Drag behavior ──
+    const drag = d3.drag<SVGGElement, SimNode>()
+      .on('start', function (this: SVGGElement, event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, d: SimNode) {
+        didDrag = false
+        d.fx = d.x
+        d.fy = d.y
+        if (simRef.current) {
+          simRef.current.alphaTarget(0.3).restart()
+        }
+        d3.select(this).raise()
+      })
+      .on('drag', function (this: SVGGElement, event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, d: SimNode) {
+        didDrag = true
+        d.fx = event.x
+        d.fy = event.y
+        if (!simRef.current) {
+          // Static mode: manually update DOM (no simulation tick handler running)
+          d.x = event.x
+          d.y = event.y
+          d3.select(this).attr('transform', `translate(${d.x},${d.y})`)
+          linkContainer.selectAll<SVGLineElement, SimLink>('line')
+            .filter(l => {
+              const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
+              const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
+              return sid === d.id || tid === d.id
+            })
+            .attr('x1', l => {
+              const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
+              return nodeMap.get(sid)?.x ?? 0
+            })
+            .attr('y1', l => {
+              const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
+              return nodeMap.get(sid)?.y ?? 0
+            })
+            .attr('x2', l => {
+              const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
+              return nodeMap.get(tid)?.x ?? 0
+            })
+            .attr('y2', l => {
+              const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
+              return nodeMap.get(tid)?.y ?? 0
+            })
+        }
+      })
+      .on('end', function (_event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, _d: SimNode) {
+        if (simRef.current) {
+          simRef.current.alphaTarget(0)
+        }
+        // Node stays where user placed it — do NOT clear fx/fy
+      })
+
+    nodeMerge.call(drag)
 
     // Position links using nodeMap
     linkContainer.selectAll<SVGLineElement, SimLink>('line')
