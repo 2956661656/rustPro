@@ -51,7 +51,7 @@ const edgeWidthScale = d3.scaleSqrt().domain([0, 10]).range([EDGE_MIN_WIDTH, EDG
 type LayoutMode = 'radial' | 'tree' | 'force'
 
 function selectLayoutMode(nodeCount: number): LayoutMode {
-  if (nodeCount <= 15) return 'radial'
+  if (nodeCount <= 35) return 'radial'
   if (nodeCount <= 40) return 'tree'
   return 'force'
 }
@@ -238,7 +238,8 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
       const callers = simNodes.filter(n => callerIds.has(n.id)).sort((a, b) => a.name.localeCompare(b.name))
       const callees = simNodes.filter(n => calleeIds.has(n.id)).sort((a, b) => a.name.localeCompare(b.name))
-      const radius = Math.max(Math.min(width, height) * 0.35, 180)
+      const baseRadius = Math.max(Math.min(width, height) * 0.35, 180)
+      const radius = baseRadius * (0.6 + 0.4 * Math.min(subgraphNodes.length / 15, 2.0))
 
       // Track positioned nodes to prevent dual-role overwrite
       const positionedIds = new Set<string>()
@@ -306,59 +307,49 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       })
       console.groupEnd()
     } else if (mode === 'tree') {
-      // Build tree hierarchy with focus node as root
-      const rootData: any = { id: focusNodeId, name: focusNode.name, children: [] as any[] }
-
-      const addedChildren = new Set<string>()
-
-      for (const callerId of callerIds) {
-        if (addedChildren.has(callerId)) continue
-        const caller = subgraphNodes.find(n => n.id === callerId)
-        if (caller) {
-          rootData.children.push({ id: callerId, name: caller.name })
-          addedChildren.add(callerId)
-        }
-      }
-      for (const calleeId of calleeIds) {
-        if (addedChildren.has(calleeId)) continue
-        const callee = subgraphNodes.find(n => n.id === calleeId)
-        if (callee) {
-          rootData.children.push({ id: calleeId, name: callee.name })
-          addedChildren.add(calleeId)
-        }
-      }
-
-      const treeLayout = d3tree<any>().nodeSize([60, 120])
-      const root = treeLayout(hierarchy(rootData))
-
-      // Init simNodes; positions assigned recursively below
+      // Custom fan layout — avoids single-column vertical stacking by spreading
+      // callers/callees in a fan/arc pattern that uses 2D space efficiently.
       simNodes = subgraphNodes.map(n => ({ ...n, x: 0, y: 0, vx: 0, vy: 0 }))
 
-      const setTreePosition = (treeNode: any): void => {
-        const simNode = simNodes.find(sn => sn.id === treeNode.data.id)
-        if (!simNode) return
-
-        if (treeNode.data.id === focusNodeId) {
-          simNode.x = 0
-          simNode.y = 0
-        } else if (callerIds.has(treeNode.data.id)) {
-          // Callers go left (negate x after swapping tree x/y)
-          simNode.x = -treeNode.y
-          simNode.y = treeNode.x
-        } else {
-          // Callees go right
-          simNode.x = treeNode.y
-          simNode.y = treeNode.x
-        }
-        simNode.fx = simNode.x
-        simNode.fy = simNode.y
-
-        if (treeNode.children) {
-          for (const child of treeNode.children) setTreePosition(child)
-        }
+      // Focus node stays at center
+      const focusSim = simNodes.find(n => n.id === focusNodeId)
+      if (focusSim) {
+        focusSim.x = 0
+        focusSim.y = 0
+        focusSim.fx = 0
+        focusSim.fy = 0
       }
 
-      setTreePosition(root)
+      const callersSorted = simNodes.filter(n => callerIds.has(n.id)).sort((a, b) => a.name.localeCompare(b.name))
+      const calleesSorted = simNodes.filter(n => calleeIds.has(n.id)).sort((a, b) => a.name.localeCompare(b.name))
+      const maxSide = Math.max(callersSorted.length, calleesSorted.length, 1)
+
+      // Adaptive span — use available viewport but keep nodes visible
+      const verticalSpan = Math.min(height * 0.75, maxSide * 28)
+      const horizontalSpan = Math.min(width * 0.3, 200)
+
+      // Position callers on the left in a fan/arc shape
+      for (let i = 0; i < callersSorted.length; i++) {
+        const t = maxSide <= 1 ? 0 : (i / Math.max(maxSide - 1, 1)) * 2 - 1 // -1 to 1
+        const y = t * verticalSpan / 2
+        // Cos curve: nodes near top/bottom are closer to center (wider fan), middle ones go further out
+        const xFactor = Math.cos(t * Math.PI / 3)
+        callersSorted[i].x = -horizontalSpan * (0.6 + 0.4 * xFactor)
+        callersSorted[i].y = y
+        callersSorted[i].fx = callersSorted[i].x
+        callersSorted[i].fy = callersSorted[i].y
+      }
+
+      // Position callees on the right in a fan/arc shape
+      for (let i = 0; i < calleesSorted.length; i++) {
+        const t = maxSide <= 1 ? 0 : (i / Math.max(maxSide - 1, 1)) * 2 - 1 // -1 to 1
+        const y = t * verticalSpan / 2
+        const xFactor = Math.cos(t * Math.PI / 3)
+        calleesSorted[i].x = horizontalSpan * (0.6 + 0.4 * xFactor)
+        calleesSorted[i].y = y
+        calleesSorted[i].fx = calleesSorted[i].x
+        calleesSorted[i].fy = calleesSorted[i].y
+      }
     } else {
       // Force mode — circular initial positions (existing behavior)
       const otherNodes = subgraphNodes.filter(n => n.id !== focusNodeId)
@@ -467,15 +458,15 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     // Update text
     nodeMerge.select('text')
       .text(d => {
-        const base = d.name.length > 16 ? d.name.slice(0, 15) + '\u2026' : d.name
+        const base = d.name
         const fileName = d.filePath.split('/').pop()?.replace(/\.[^.]*$/, '') ?? d.module
         if (d.id === focusNodeId) {
-          const suffix = fileName.length > 12 ? fileName.slice(0, 11) + '\u2026' : fileName
+          const suffix = fileName
           return `${base} [${suffix}]`
         }
         const hasCollision = (nameCounts.get(d.name) ?? 0) > 1
         if (hasCollision) {
-          const suffix = fileName.length > 8 ? fileName.slice(0, 7) + '\u2026' : fileName
+          const suffix = fileName
           return `${base} [${suffix}]`
         }
         return base

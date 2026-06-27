@@ -236,7 +236,7 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
 
     // Update text
     nodeMerge.select('text')
-      .text(d => d.name.length > 16 ? d.name.slice(0, 15) + '…' : d.name)
+      .text(d => d.name)
       .attr('dx', d => radiusScale(d.fanIn + d.fanOut) + 4)
 
     // Update tooltip
