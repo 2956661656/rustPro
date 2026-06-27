@@ -1,0 +1,19 @@
+appId: com.rustcallgraph.analyzer
+productName: Rust Call Graph Analyzer
+directories:
+  buildResources: build
+  output: release
+files:
+  - dist
+  - dist-electron
+  - "!node_modules"
+win:
+  target:
+    - nsis
+mac:
+  target:
+    - dmg
+  entitlements: build/entitlements.mac.plist
+linux:
+  target:
+    - AppImage
