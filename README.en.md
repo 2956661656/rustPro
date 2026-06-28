@@ -21,7 +21,7 @@ A visual call graph analysis tool for Rust projects based on rust-analyzer LSP. 
 - **🖱️ Node Dragging** — Freely drag nodes to adjust layout in force mode
 - **⭐ Highlight System** — Highlight connected paths on selection, auto-dim unrelated nodes
 - **🔄 Recursive Peek** — Hover or right-click nodes to progressively reveal third-layer and deeper call relationships with gradual blur + opacity falloff; supports recursive expansion
-- **💡 Smart Tooltip** — Hover to show detailed node info (fixed bottom-right by default); automatically moves to the opposite side during drag to avoid occlusion; stays in place after release
+- **💡 Smart Tooltip** — Hover to show detailed node info; automatically moves to the opposite side during drag to avoid occlusion; stays in place after release
 
 ## Installation
 
