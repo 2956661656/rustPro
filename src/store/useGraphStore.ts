@@ -76,9 +76,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   }),
 
   addEdges: (newEdges) => set((state) => {
-    // Deduplicate edges by source+target
-    const existingKeys = new Set(state.edges.map(e => `${e.source}:${e.target}`))
-    const uniqueNew = newEdges.filter(e => !existingKeys.has(`${e.source}:${e.target}`))
+    // Deduplicate edges by source+target+edgeKind
+    const existingKeys = new Set(state.edges.map(e => `${e.source}:${e.target}:${e.edgeKind ?? 'call'}`))
+    const uniqueNew = newEdges.filter(e => !existingKeys.has(`${e.source}:${e.target}:${e.edgeKind ?? 'call'}`))
 
     if (uniqueNew.length === 0) return state
 

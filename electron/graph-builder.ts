@@ -51,6 +51,9 @@ export class GraphBuilder {
   private scanner: ProjectScanner
   private workspaceRoot: string
 
+  // Trait implementation tracking: traitDefNodeId → implNodeId[]
+  private traitDefToImplsMap: Map<string, string[]> = new Map()
+
   constructor(client: LSPClient, workspaceRoot: string) {
     this.client = client
     this.scanner = new ProjectScanner({ workspaceRoot })
@@ -112,6 +115,9 @@ export class GraphBuilder {
     const duration = Date.now() - startTime
     console.log(`[GraphBuilder] discoverNodes complete: ${nodes.length} nodes, ${fileCount} files, ${duration}ms`)
 
+    // Build trait implementation mappings from discovered nodes
+    this.buildTraitMappings(nodes)
+
     return {
       nodes,
       filesProcessed: fileCount,
@@ -123,10 +129,17 @@ export class GraphBuilder {
    * Recursively extract function nodes from document symbols.
    * DocumentSymbol in LSP can have nested children (e.g., impl blocks with methods).
    */
-  private extractNodesFromSymbols(symbols: any[], file: ScannedFile, parentTraitKind?: TraitKind): FunctionNode[] {
+  private extractNodesFromSymbols(
+    symbols: any[],
+    file: ScannedFile,
+    parentTraitKind?: TraitKind,
+    parentTraitName?: string,
+  ): FunctionNode[] {
     const nodes: FunctionNode[] = []
 
     for (const symbol of symbols) {
+      console.log(`[GraphBuilder] Symbol: kind=${symbol.kind} (${SymbolKind[symbol.kind] ?? 'unknown'}) name="${symbol.name}" detail="${symbol.detail ?? ''}" children=${Array.isArray(symbol.children) ? symbol.children.length : 0}`)
+
       // Only include functions and methods
       if (this.isFunctionOrMethod(symbol.kind)) {
         const moduleName = this.inferModuleName(file)
@@ -148,27 +161,95 @@ export class GraphBuilder {
           endLine: symbol.range?.end?.line,
           endCharacter: symbol.range?.end?.character,
           traitKind: parentTraitKind ?? 'none',
+          traitName: parentTraitName,
         }
         nodes.push(node)
+        if (parentTraitKind) {
+          console.log(`[GraphBuilder] Node "${node.name}" (id=${node.id}) traitKind=${node.traitKind} traitName=${node.traitName}`)
+        }
       }
 
       // Recurse into children (e.g., impl blocks, nested modules)
       if (Array.isArray(symbol.children)) {
         // Determine trait context for children of this symbol
         let childCtx: TraitKind = parentTraitKind ?? 'none'
+        let childTraitName: string | undefined = parentTraitName
+
         // parent is a trait definition (Interface = 11)
         if (symbol.kind === SymbolKind.Interface) {
+          console.log(`[GraphBuilder] Trait def parent: "${symbol.name}" — children will get traitKind='definition'`)
           childCtx = 'definition'
+          childTraitName = symbol.name
         }
-        // parent is a trait impl (Class, name contains "for" as a word)
-        else if (symbol.kind === SymbolKind.Class && typeof symbol.name === 'string' && /\bfor\b/.test(symbol.name)) {
+        // parent is a trait impl (Class/Object, name contains "for" as a word)
+        else if ((symbol.kind === SymbolKind.Class || symbol.kind === SymbolKind.Object) && typeof symbol.name === 'string' && /\bfor\b/.test(symbol.name)) {
           childCtx = 'implementation'
+          const match = symbol.name.match(/^impl\s+(\w+)\s+for/)
+          childTraitName = match ? match[1] : undefined
+          console.log(`[GraphBuilder] Trait impl parent: "${symbol.name}" — trait="${childTraitName}" children will get traitKind='implementation'`)
         }
-        nodes.push(...this.extractNodesFromSymbols(symbol.children, file, childCtx))
+
+        nodes.push(...this.extractNodesFromSymbols(symbol.children, file, childCtx, childTraitName))
       }
     }
 
     return nodes
+  }
+
+  /**
+   * Build mappings from trait definition nodes to their implementation nodes.
+   * Direction: def → impl[] (one trait definition can have many implementations).
+   * Only works within the scanned project (user code traits only).
+   */
+  private buildTraitMappings(nodes: FunctionNode[]): void {
+    // Group definition nodes by (traitName, methodName)
+    const defMap = new Map<string, string>()  // key: "traitName::methodName" → nodeId
+    let defCount = 0
+    let implCount = 0
+    let matchedCount = 0
+    let unmatchedCount = 0
+
+    for (const node of nodes) {
+      if (node.traitKind === 'definition' && node.traitName) {
+        const key = `${node.traitName}::${node.name}`
+        // Sanity check: there should only be one definition per trait method
+        if (defMap.has(key)) {
+          console.warn(`[GraphBuilder] Duplicate trait definition key "${key}": existing=${defMap.get(key)}, new=${node.id}`)
+        }
+        defMap.set(key, node.id)
+        defCount++
+        console.log(`[GraphBuilder] Trait def found: ${node.name} (trait="${node.traitName}", key="${key}", id=${node.id})`)
+      }
+    }
+
+    // Match implementation nodes to definitions
+    this.traitDefToImplsMap.clear()
+    for (const node of nodes) {
+      if (node.traitKind === 'implementation' && node.traitName) {
+        implCount++
+        const key = `${node.traitName}::${node.name}`
+        const defNodeId = defMap.get(key)
+        if (defNodeId) {
+          const impls = this.traitDefToImplsMap.get(defNodeId)
+          if (impls) {
+            impls.push(node.id)
+          } else {
+            this.traitDefToImplsMap.set(defNodeId, [node.id])
+          }
+          matchedCount++
+          console.log(`[GraphBuilder] Trait mapping MATCH: def=${defNodeId} (${node.traitName}::${node.name}) ⇢ impl=${node.id} (${node.name})`)
+        } else {
+          unmatchedCount++
+          console.log(`[GraphBuilder] Trait mapping NO MATCH: impl=${node.id} (${node.name}) — trait "${node.traitName}" definition not found in project`)
+        }
+      }
+    }
+
+    // Summary
+    for (const [defId, implIds] of this.traitDefToImplsMap) {
+      console.log(`[GraphBuilder] Trait summary: def=${defId} → ${implIds.length} impl(s): [${implIds.join(', ')}]`)
+    }
+    console.log(`[GraphBuilder] buildTraitMappings complete: ${defCount} defs, ${implCount} impls, ${matchedCount} matched, ${unmatchedCount} unmatched, ${this.traitDefToImplsMap.size} def→impl entries`)
   }
 
   /**
@@ -321,7 +402,49 @@ export class GraphBuilder {
         console.log(`[GraphBuilder] Discovered ${newNodes.length} new nodes via call hierarchy`)
       }
 
-      console.log(`[GraphBuilder] getEdgesForNode done: ${node.name} → ${incoming.length} incoming + ${outgoing.length} outgoing + ${newNodes.length} new, ${Date.now() - startTime}ms`)
+      // ── Add trait implementation edges if applicable ──
+      // Direction: always FROM trait definition TO implementation
+      //
+      // Case A: focus node is a trait DEFINITION → add OUTGOING edges to all its implementations
+      if (this.traitDefToImplsMap.has(node.id)) {
+        const implIds = this.traitDefToImplsMap.get(node.id)!
+        console.log(`[GraphBuilder] Trait def focus: "${node.name}" (id=${node.id}) has ${implIds.length} impl(s), adding outgoing trait edge(s)`)
+        for (const implId of implIds) {
+          console.log(`[GraphBuilder] Trait edge (outgoing): def=${node.id} → impl=${implId}`)
+          outgoing.push({
+            source: node.id,
+            target: implId,
+            callCount: 0,
+            callSites: [],
+            isExternal: false,
+            edgeKind: 'trait_impl',
+          })
+        }
+      }
+      // Case B: focus node is a trait IMPLEMENTATION → add INCOMING edge from its trait definition
+      else {
+        for (const [defId, implIds] of this.traitDefToImplsMap) {
+          if (implIds.includes(node.id)) {
+            console.log(`[GraphBuilder] Trait impl focus: "${node.name}" (id=${node.id}) belongs to def=${defId}, adding incoming trait edge`)
+            incoming.push({
+              source: defId,
+              target: node.id,
+              callCount: 0,
+              callSites: [],
+              isExternal: false,
+              edgeKind: 'trait_impl',
+            })
+            break
+          }
+        }
+      }
+
+      // Count trait edges in the totals
+      const traitIncoming = incoming.filter(e => e.edgeKind === 'trait_impl').length
+      const traitOutgoing = outgoing.filter(e => e.edgeKind === 'trait_impl').length
+      const callIncoming = incoming.length - traitIncoming
+      const callOutgoing = outgoing.length - traitOutgoing
+      console.log(`[GraphBuilder] getEdgesForNode done: ${node.name} → ${callIncoming} call-in + ${traitIncoming} trait-in / ${callOutgoing} call-out + ${traitOutgoing} trait-out (${newNodes.length} new), ${Date.now() - startTime}ms`)
       return { incoming, outgoing, newNodes }
     } finally {
       // Close the file
@@ -502,6 +625,7 @@ export class GraphBuilder {
       endLine: item.range?.end?.line,
       endCharacter: item.range?.end?.character,
       traitKind: 'none' as TraitKind,
+      traitName: undefined,
     }
   }
 }

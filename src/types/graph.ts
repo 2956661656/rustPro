@@ -19,6 +19,7 @@ export interface FunctionNode {
   endLine?: number
   endCharacter?: number
   traitKind: TraitKind
+  traitName?: string
 }
 
 /**
@@ -39,6 +40,7 @@ export interface CallEdge {
   callCount: number
   callSites: Array<{ file: string; line: number }>
   isExternal: boolean
+  edgeKind?: 'call' | 'trait_impl'
 }
 
 export interface CallGraphData {

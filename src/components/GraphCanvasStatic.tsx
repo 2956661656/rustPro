@@ -20,6 +20,7 @@ interface SimLink {
   target: string | SimNode
   callCount: number
   callSites: Array<{ file: string; line: number }>
+  edgeKind?: 'call' | 'trait_impl'
 }
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -174,6 +175,7 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
       target: e.target,
       callCount: e.callCount,
       callSites: e.callSites,
+      edgeKind: e.edgeKind,
     }))
 
     // ── Links: D3 join with key function ──
@@ -182,16 +184,17 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
 
     const link = linkContainer
       .selectAll<SVGLineElement, SimLink>('line')
-      .data(simLinks, d => `${(d.source as SimNode).id}:${(d.target as SimNode).id}`)
+      .data(simLinks, d => `${(d.source as SimNode).id}:${(d.target as SimNode).id}:${d.edgeKind ?? 'call'}`)
 
     link.exit()
       .transition().duration(200).attr('stroke-opacity', 0)
       .remove()
 
     const linkEnter = link.join('line')
-      .attr('stroke', '#555')
-      .attr('stroke-opacity', 0.6)
-      .attr('stroke-width', d => edgeWidthScale(d.callCount))
+      .attr('stroke', d => d.edgeKind === 'trait_impl' ? '#00bcd4' : '#555')
+      .attr('stroke-opacity', d => d.edgeKind === 'trait_impl' ? 0.8 : 0.6)
+      .attr('stroke-width', d => d.edgeKind === 'trait_impl' ? 2 : edgeWidthScale(d.callCount))
+      .attr('stroke-dasharray', d => d.edgeKind === 'trait_impl' ? '8,3,2,3' : null)
       .attr('marker-end', 'url(#arrow)')
 
     // ── Nodes: D3 join with key function ──
@@ -362,6 +365,12 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
       const line = d3.select(this)
       const sourceId = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
       const targetId = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
+
+      if (d.edgeKind === 'trait_impl') {
+        line.attr('stroke', '#00bcd4').attr('stroke-opacity', 0.8)
+        return
+      }
+
       const selectedInvolved = sourceId === selectedNodeId || targetId === selectedNodeId
       const sourceHL = highlightedNodeIds.includes(sourceId)
       const targetHL = highlightedNodeIds.includes(targetId)

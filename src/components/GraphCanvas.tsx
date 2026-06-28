@@ -24,6 +24,7 @@ interface SimLink {
   callCount: number
   callSites: Array<{ file: string; line: number }>
   isExternal: boolean
+  edgeKind?: 'call' | 'trait_impl'
 }
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -539,6 +540,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       callCount: e.callCount,
       callSites: e.callSites,
       isExternal: e.isExternal,
+      edgeKind: e.edgeKind,
     }))
 
     // ── Interrupt stale transitions before D3 join ──
@@ -553,7 +555,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       .data(simLinks, d => {
         const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
         const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-        return `${sid}:${tid}`
+        return `${sid}:${tid}:${d.edgeKind ?? 'call'}`
       })
 
     console.log('[GC] Link data join:', {
@@ -574,10 +576,19 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       .attr('stroke-opacity', 0)
 
     const linkMerge = linkEnter.merge(link)
-      .attr('stroke', d => d.isExternal ? '#444' : '#888')
-      .attr('stroke-opacity', 0.6)
-      .attr('stroke-width', d => edgeWidthScale(d.callCount))
-      .attr('stroke-dasharray', d => d.isExternal ? '4,2' : null)
+      .attr('stroke', d => {
+        if (d.edgeKind === 'trait_impl') return '#00bcd4'  // Cyan for trait edges
+        return d.isExternal ? '#444' : '#888'
+      })
+      .attr('stroke-opacity', d => d.edgeKind === 'trait_impl' ? 0.8 : 0.6)
+      .attr('stroke-width', d => {
+        if (d.edgeKind === 'trait_impl') return 2
+        return edgeWidthScale(d.callCount)
+      })
+      .attr('stroke-dasharray', d => {
+        if (d.edgeKind === 'trait_impl') return '8,3,2,3'  // dash-dot-dash for trait edges
+        return d.isExternal ? '4,2' : null
+      })
       .attr('marker-end', 'url(#arrow)')
 
     linkEnter.transition().duration(300).attr('stroke-opacity', 0.6)
@@ -1058,6 +1069,13 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       const line = d3.select(this)
       const sourceId = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
       const targetId = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
+
+      // Trait edges keep their distinctive style
+      if (d.edgeKind === 'trait_impl') {
+        line.attr('stroke', '#00bcd4').attr('stroke-opacity', 0.8)
+        return  // Skip further highlight processing
+      }
+
       const selectedInvolved = sourceId === selectedNodeId || targetId === selectedNodeId
       const sourceHL = highlightedNodeIds.includes(sourceId)
       const targetHL = highlightedNodeIds.includes(targetId)
