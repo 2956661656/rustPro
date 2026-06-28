@@ -32,7 +32,7 @@
 
 ```bash
 # 克隆仓库
-git clone <repo-url>
+git clone [<repo-url>](https://github.com/2956661656/rustPro.git)
 cd rustPro
 
 # 安装依赖
