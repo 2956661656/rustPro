@@ -13,7 +13,10 @@ export interface LSPAPI {
   getEdgesForNode: (nodeJson: string) => Promise<{ incoming: CallEdge[]; outgoing: CallEdge[]; newNodes: FunctionNode[] }>
   getEdgesForNodes: (nodesJson: string) => Promise<{ edges: CallEdge[]; newNodes: FunctionNode[]; functionsProcessed: number; totalFunctions: number }>
   getCompleteGraph: (projectPath: string) => Promise<CallGraphData>
+  getDirectoryTree: (projectPath: string) => Promise<import('../types/directory').FileTreeNode>
   getFunctionStats: (nodeJson: string) => Promise<any>
+  getFunctionSource: (nodeJson: string) => Promise<{ source: string; startLine: number; endLine: number; filePath: string }>
+  getHoverInfo: (nodeJson: string) => Promise<{ markdown: string | null; found: boolean }>
   shutdownLSP: () => Promise<{ status: string }>
   onProgress: (callback: (progress: number, message: string) => void) => () => void
   onError: (callback: (error: string) => void) => () => void
@@ -176,6 +179,10 @@ export function useLSPClient() {
     }
   }, [api, reset])
 
+  const getHoverInfo = useCallback(async (node: FunctionNode) => {
+    return await api.getHoverInfo(JSON.stringify(node))
+  }, [api])
+
   /**
    * Ping the backend.
    */
@@ -189,6 +196,7 @@ export function useLSPClient() {
     loadEdgesForNodes,
     buildCompleteGraph,
     shutdownLSP,
+    getHoverInfo,
     ping,
   }
 }

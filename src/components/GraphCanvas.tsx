@@ -4,6 +4,7 @@ import { hierarchy, tree as d3tree } from 'd3-hierarchy'
 import { useGraphStore } from '../store/useGraphStore'
 import { useLSPClient } from '../hooks/useLSPClient'
 import type { FunctionNode, CallEdge } from '../types/graph'
+import { getDisplayName } from '../types/graph'
 import EdgeStateOverlay from './EdgeStateOverlay'
 
 // ─── Types ──────────────────────────────────────────────────────────
@@ -56,6 +57,122 @@ function selectLayoutMode(nodeCount: number): LayoutMode {
   return 'force'
 }
 
+// ─── Simple markdown renderer for hover tooltips ────────────────────
+
+function renderHoverMarkdown(md: string): React.ReactNode {
+  // Split into lines and process
+  const lines = md.split('\n')
+  const elements: React.ReactNode[] = []
+  let inCodeBlock = false
+  let codeBlockLines: string[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+
+    // Code block fence
+    if (line.startsWith('```')) {
+      if (inCodeBlock) {
+        elements.push(
+          <pre key={`code-${i}`} style={{
+            background: '#0a0a1e',
+            padding: '6px 8px',
+            borderRadius: 4,
+            overflow: 'auto',
+            fontSize: 11,
+            lineHeight: 1.4,
+            margin: '4px 0',
+          }}>
+            <code>{codeBlockLines.join('\n')}</code>
+          </pre>
+        )
+        codeBlockLines = []
+        inCodeBlock = false
+      } else {
+        inCodeBlock = true
+        codeBlockLines = []
+      }
+      continue
+    }
+
+    if (inCodeBlock) {
+      codeBlockLines.push(line)
+      continue
+    }
+
+    // Empty line = paragraph break
+    if (line.trim() === '') {
+      elements.push(<br key={`br-${i}`} />)
+      continue
+    }
+
+    // Render inline content with basic markdown formatting
+    const rendered = renderInlineMarkdown(line)
+    elements.push(<div key={`line-${i}`} style={{ marginBottom: 2 }}>{rendered}</div>)
+  }
+
+  // Unclosed code block (shouldn't happen, but handle gracefully)
+  if (inCodeBlock && codeBlockLines.length > 0) {
+    elements.push(
+      <pre key={`code-${lines.length}`} style={{
+        background: '#0a0a1e', padding: '6px 8px', borderRadius: 4, fontSize: 11,
+      }}>
+        <code>{codeBlockLines.join('\n')}</code>
+      </pre>
+    )
+  }
+
+  return <>{elements}</>
+}
+
+/**
+ * Render a single line of inline markdown (bold, code, inline code).
+ */
+function renderInlineMarkdown(line: string): React.ReactNode {
+  // Bold: **text**
+  const parts: React.ReactNode[] = []
+  let remaining = line
+  let key = 0
+
+  // Simple tokenizer for inline formatting
+  const regex = /(\*\*(.+?)\*\*|`([^`]+)`)/g
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+
+  while ((match = regex.exec(remaining)) !== null) {
+    // Plain text before match
+    if (match.index > lastIndex) {
+      parts.push(<span key={key++}>{remaining.slice(lastIndex, match.index)}</span>)
+    }
+
+    if (match[1]?.startsWith('**')) {
+      // Bold: **text**
+      parts.push(<strong key={key++} style={{ color: '#fff' }}>{match[2]}</strong>)
+    } else if (match[3] !== undefined) {
+      // Inline code: `code`
+      parts.push(
+        <code key={key++} style={{
+          background: '#0a0a1e',
+          padding: '1px 4px',
+          borderRadius: 3,
+          fontSize: 11,
+          color: '#e94560',
+        }}>
+          {match[3]}
+        </code>
+      )
+    }
+
+    lastIndex = match.index + match[0].length
+  }
+
+  // Remaining text after last match
+  if (lastIndex < remaining.length) {
+    parts.push(<span key={key++}>{remaining.slice(lastIndex)}</span>)
+  }
+
+  return parts.length > 0 ? <>{parts}</> : line
+}
+
 // ─── Component ──────────────────────────────────────────────────────
 
 interface GraphCanvasProps {
@@ -75,11 +192,22 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
   const gRef = useRef<d3.Selection<SVGGElement, unknown, null, undefined> | null>(null)
   const stableOnClickRef = useRef<((node: FunctionNode) => void) | undefined>(undefined)
   const diagLoggedRef = useRef(false)
+  const prevEffectKeyRef = useRef<string | null>(null)
   stableOnClickRef.current = onNodeClick
 
   // Loading / error state for edge fetching
   const [isLoadingEdges, setIsLoadingEdges] = useState(false)
   const [edgeError, setEdgeError] = useState<string | null>(null)
+
+  // ── Tooltip / hover state ──
+  const [tooltipVisible, setTooltipVisible] = useState(false)
+  const [tooltipContent, setTooltipContent] = useState<string | null>(null)
+  const [tooltipLoading, setTooltipLoading] = useState(false)
+  const [tooltipPos, setTooltipPos] = useState({ x: 0, y: 0 })
+  const tooltipCacheRef = useRef<Map<string, string>>(new Map())
+  const tooltipLoadingSetRef = useRef<Set<string>>(new Set())
+  const hoveredNodeIdRef = useRef<string | null>(null)
+  const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Store subscriptions
   const nodes = useGraphStore(s => s.nodes)
@@ -90,7 +218,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
   const showExternal = useGraphStore(s => s.showExternal)
 
   // LSP client for on-demand edge loading
-  const { loadEdgesForNode } = useLSPClient()
+  const { loadEdgesForNode, getHoverInfo } = useLSPClient()
 
   // ── Effect 1a: Initialize SVG, zoom, groups (runs ONCE) ──────────
   useEffect(() => {
@@ -99,7 +227,13 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     initializedRef.current = true
 
     const svg = d3.select<SVGSVGElement, unknown>(svgRef.current!)
-    svg.selectAll('*').remove()
+
+    // Remove only Effect 1's own children (recreated below) — do NOT wipe D3 nodes from Effect 2
+    svg.selectAll<SVGDefsElement, unknown>('defs').remove()
+    let g = svg.select<SVGGElement>('.graph-root')
+    if (g.empty()) {
+      g = svg.append('g').attr('class', 'graph-root')
+    }
 
     // Arrow marker (scaled down for subgraph)
     const defs = svg.append('defs')
@@ -115,8 +249,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       .attr('d', 'M0,-6L12,0L0,6')
       .attr('fill', '#e94560')
 
-    // Graphics container
-    const g = svg.append('g').attr('class', 'graph-root')
+    // Graphics container — reuse existing if present
     gRef.current = g
 
     // Zoom
@@ -207,6 +340,17 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     }
     const subgraphNodes = nodes.filter(n => relatedNodeIds.has(n.id))
     if (subgraphNodes.length === 0) return
+
+    // ── Duplicate render guard ──
+    // Effect 2 sometimes fires twice with identical data due to React batching edge cases.
+    // Skip the D3 join entirely when the key matches, preventing duplicate DOM elements.
+    const effectKey = `${focusNodeId}:${nodes.length}:${edges.length}:${showExternal}`
+    if (prevEffectKeyRef.current === effectKey) {
+      console.log('[GC] Duplicate Effect 2, skip render')
+      return  // Skip the rest — DOM already matches data
+    }
+    prevEffectKeyRef.current = effectKey
+    diagLoggedRef.current = false
 
     // Diagnostic: check for duplicate node IDs in subgraph
     const subgraphIdSet = new Set<string>()
@@ -372,6 +516,14 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       })
     }
 
+    console.log('[GC] simNodes data:', simNodes.map(n => ({
+      id: n.id,
+      name: n.name,
+      x: n.x?.toFixed(1),
+      y: n.y?.toFixed(1),
+      role: n.id === focusNodeId ? 'FOCUS' : callerIds.has(n.id) ? 'CALLER' : 'CALLEE'
+    })))
+
     const nodeMap = new Map<string, SimNode>()
     for (const n of simNodes) nodeMap.set(n.id, n)
 
@@ -389,6 +541,9 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       isExternal: e.isExternal,
     }))
 
+    // ── Interrupt stale transitions before D3 join ──
+    g.selectAll('*').interrupt()
+
     // ── Links: D3 join ──
     const linkGroup = g.selectAll<SVGGElement, unknown>('.link-group').data([null])
     const linkContainer = linkGroup.join('g').attr('class', 'link-group')
@@ -401,16 +556,31 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         return `${sid}:${tid}`
       })
 
+    console.log('[GC] Link data join:', {
+      existingEls: linkContainer.selectAll('line').size(),
+      dataSize: simLinks.length,
+      enter: link.enter().size(),
+      update: link.size(),
+      exit: link.exit().size(),
+    })
+
     link.exit()
       .transition().duration(200).attr('stroke-opacity', 0)
+      .on('end interrupt', function() { d3.select(this).remove() })
       .remove()
 
-    const linkEnter = link.join('line')
+    const linkEnter = link.enter()
+      .append('line')
+      .attr('stroke-opacity', 0)
+
+    const linkMerge = linkEnter.merge(link)
       .attr('stroke', d => d.isExternal ? '#444' : '#888')
       .attr('stroke-opacity', 0.6)
       .attr('stroke-width', d => edgeWidthScale(d.callCount))
       .attr('stroke-dasharray', d => d.isExternal ? '4,2' : null)
       .attr('marker-end', 'url(#arrow)')
+
+    linkEnter.transition().duration(300).attr('stroke-opacity', 0.6)
 
     // ── Nodes: D3 join ──
     const nodeGroup = g.selectAll<SVGGElement, unknown>('.node-group').data([null])
@@ -420,9 +590,18 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       .selectAll<SVGGElement, SimNode>('.node')
       .data(simNodes, d => d.id)
 
+    console.log('[GC] D3 node join:', {
+      existingElements: nodeContainer.selectAll('.node').size(),
+      dataSize: simNodes.length,
+      enterSize: node.enter().size(),
+      updateSize: node.size(),
+      exitSize: node.exit().size(),
+    })
+
     // Exit: remove old nodes
     node.exit()
       .transition().duration(200).attr('opacity', 0)
+      .on('end interrupt', function() { d3.select(this).remove() })
       .remove()
 
     // Enter: create new nodes
@@ -446,22 +625,31 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       .attr('fill', d => d.isUserCode === false ? '#666' : '#ccc')
       .attr('pointer-events', 'none')
       .style('text-shadow', '1px 1px 2px rgba(0,0,0,0.8)')
-
-    nodeEnter.append('title')
+      .text(d => getDisplayName(d))  // belt-and-suspenders: set text on enter too
 
     // Merge: update all nodes
     const nodeMerge = nodeEnter.merge(node)
+
+    // Ensure UPDATE elements have full opacity (stale Effect 2 runs can
+    // interrupt their enter-fade transition, leaving them nearly invisible)
+    node.attr('opacity', 1)
+
+    console.log('[GC] Post-merge elements:', {
+      nodeGroupElements: nodeContainer.selectAll('.node').size(),
+      simNodeCount: simNodes.length,
+    })
 
     // Update circle
     nodeMerge.select('circle')
       .attr('r', d => d.isUserCode === false ? 5 : radiusScale(d.fanIn + d.fanOut))
       .attr('fill', d => d.isUserCode === false ? '#555' : colorScale(d.module))
       .attr('stroke-width', d => d.isUserCode === false ? 2 : 1.5)
+      .attr('opacity', 1)
 
     // Update text
     nodeMerge.select('text')
       .text(d => {
-        const base = d.name
+        const base = getDisplayName(d)
         const fileName = d.filePath.split('/').pop()?.replace(/\.[^.]*$/, '') ?? d.module
         if (d.id === focusNodeId) {
           const suffix = fileName
@@ -476,28 +664,145 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       })
       .attr('dx', d => (d.isUserCode === false ? 5 : radiusScale(d.fanIn + d.fanOut)) + 4)
 
-    // Update tooltip
-    nodeMerge.select('title')
-      .text(d => `${d.name}\n${d.filePath}:${d.line}\nmodule: ${d.module}\nfan-in: ${d.fanIn} | fan-out: ${d.fanOut}`)
-
     // Fade in new nodes
     nodeEnter.transition().duration(300).attr('opacity', 1)
 
+    setTimeout(() => {
+      const actualNodes = nodeContainer.selectAll('.node').size()
+      const actualLinks = linkContainer.selectAll('line').size()
+      const emptyTextNodes = nodeContainer.selectAll('.node text').filter(function() {
+        return d3.select(this).text() === ''
+      }).size()
+      console.log('[GC] Post-fade DOM check:', {
+        nodeElements: actualNodes,
+        expectedNodes: simNodes.length,
+        linkElements: actualLinks,
+        expectedLinks: simLinks.length,
+        emptyTextElements: emptyTextNodes,
+      })
+    }, 500)
+
     // ── Click handler ──
     nodeMerge.on('click', (_event, d) => {
-      if (didDrag) return  // skip click events that follow a drag
-
-      // Cancel in-flight edge request before dispatching new focus
-      if (d.id !== focusNodeId) {
-        setIsLoadingEdges(false)
-        useGraphStore.getState().focusNode(d.id)
-      } else {
-        useGraphStore.getState().setSelectedNode(d.id)
+      console.log('[GC] 👆 click fired:', d.name, 'didDrag:', didDrag, 'hasCallback:', !!stableOnClickRef.current)
+      if (didDrag) {
+        console.log('[GC] ⛔ click suppressed by didDrag')
+        return  // skip click events that follow a drag
       }
 
+      // Only use the stable callback for navigation — it routes through App.tsx's handleNodeClick
+      // which calls focusNode via the store. This avoids double-focusNode calls.
+      setIsLoadingEdges(false)
+      console.log('[GC] ✅ click will call callback:', d.name, d.id)
       if (stableOnClickRef.current) {
         stableOnClickRef.current(d)
       }
+    })
+
+    // ── Hover / tooltip handler ──
+    nodeMerge.on('mouseenter', function (this: SVGGElement, event: MouseEvent, d: SimNode) {
+      // Cancel any pending hide
+      if (hideTimeoutRef.current) {
+        clearTimeout(hideTimeoutRef.current)
+        hideTimeoutRef.current = null
+      }
+
+      // Position tooltip dynamically away from the cursor to avoid covering nodes
+      const container = svgRef.current?.parentElement
+      if (container) {
+        const rect = container.getBoundingClientRect()
+        const mouseX = event.clientX - rect.left
+        const mouseY = event.clientY - rect.top
+
+        // Tooltip estimated dimensions
+        const tooltipW = Math.min(400, rect.width * 0.6)
+        const tooltipH = Math.min(350, rect.height * 0.5)
+
+        // Choose direction: expand toward the larger empty space
+        const spaceRight = rect.width - mouseX
+        const spaceLeft = mouseX
+        const spaceBelow = rect.height - mouseY
+        const spaceAbove = mouseY
+
+        // Prefer the direction with more space, flip if not enough room
+        const goRight = spaceRight > spaceLeft
+        const goDown = spaceBelow > spaceAbove
+
+        const x = goRight
+          ? Math.min(mouseX + 14, rect.width - tooltipW - 6)
+          : Math.max(6, mouseX - tooltipW - 14)
+        const y = goDown
+          ? Math.min(mouseY + 14, rect.height - tooltipH - 6)
+          : Math.max(6, mouseY - tooltipH - 14)
+
+        setTooltipPos({ x, y })
+      }
+
+      hoveredNodeIdRef.current = d.id
+      setTooltipVisible(true)
+
+      // Check cache first
+      const cache = tooltipCacheRef.current
+      if (cache.has(d.id)) {
+        setTooltipContent(cache.get(d.id)!)
+        setTooltipLoading(false)
+        return
+      }
+
+      // Avoid duplicate in-flight requests
+      if (tooltipLoadingSetRef.current.has(d.id)) return
+      tooltipLoadingSetRef.current.add(d.id)
+
+      setTooltipLoading(true)
+      setTooltipContent(null)
+
+      getHoverInfo(d)
+        .then(result => {
+          if (result.found && result.markdown) {
+            cache.set(d.id, result.markdown)
+            // Only set state if still hovering this node
+            if (hoveredNodeIdRef.current === d.id) {
+              setTooltipContent(result.markdown)
+            }
+          } else {
+            // Fallback: show basic info as fallback markdown
+            const fallback = [
+              `**${getDisplayName(d)}**`,
+              '',
+              `**File:** \`${d.filePath}:${d.line}\``,
+              `**Module:** ${d.module}`,
+              `**Fan-in:** ${d.fanIn} | **Fan-out:** ${d.fanOut}`,
+            ].join('\n')
+            cache.set(d.id, fallback)
+            if (hoveredNodeIdRef.current === d.id) {
+              setTooltipContent(fallback)
+            }
+          }
+        })
+        .catch(() => {
+          if (hoveredNodeIdRef.current === d.id) {
+            setTooltipContent(null)
+          }
+        })
+        .finally(() => {
+          tooltipLoadingSetRef.current.delete(d.id)
+          if (hoveredNodeIdRef.current === d.id) {
+            setTooltipLoading(false)
+          }
+        })
+    })
+
+    nodeMerge.on('mouseleave', function (this: SVGGElement, _event: MouseEvent, d: SimNode) {
+      if (hoveredNodeIdRef.current === d.id) {
+        hoveredNodeIdRef.current = null
+      }
+
+      // Small delay to avoid flicker when moving between adjacent nodes
+      hideTimeoutRef.current = setTimeout(() => {
+        setTooltipVisible(false)
+        setTooltipContent(null)
+        setTooltipLoading(false)
+      }, 300)
     })
 
     // Set initial positions immediately (before simulation starts)
@@ -505,17 +810,35 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
     // ── Drag behavior ──
     const drag = d3.drag<SVGGElement, SimNode>()
+      .clickDistance(3)
       .on('start', function (this: SVGGElement, event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, d: SimNode) {
         didDrag = false
+        console.log('[GC] 🖱️ drag start:', d.name, 'at', event.x.toFixed(0), event.y.toFixed(0))
+        // Store drag start position on the element for distance check
+        d3.select(this).attr('data-drag-x', event.x).attr('data-drag-y', event.y)
         d.fx = d.x
         d.fy = d.y
         if (simRef.current) {
           simRef.current.alphaTarget(0.3).restart()
         }
-        d3.select(this).raise()
+        // NOTE: d3.select(this).raise() intentionally omitted — it interferes
+        // with D3 v7's synthetic click dispatch after drag (the DOM move during
+        // the start handler prevents the 'click' event from firing on mouseup).
       })
       .on('drag', function (this: SVGGElement, event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, d: SimNode) {
-        didDrag = true
+        // Only treat as drag if mouse moved more than 3px — prevents tiny
+        // click jitter from suppressing the click handler via didDrag.
+        const el = d3.select(this)
+        const startX = parseFloat(el.attr('data-drag-x'))
+        const startY = parseFloat(el.attr('data-drag-y'))
+        const dx = event.x - startX
+        const dy = event.y - startY
+        console.log('[GC] 🖱️ drag move:', d.name, 'dist²:', (dx*dx + dy*dy).toFixed(1))
+        if (!isNaN(startX) && !isNaN(startY)) {
+          if (dx * dx + dy * dy > 9) {
+            didDrag = true
+          }
+        }
         d.fx = event.x
         d.fy = event.y
         if (!simRef.current) {
@@ -523,6 +846,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
           d.x = event.x
           d.y = event.y
           d3.select(this).attr('transform', `translate(${d.x},${d.y})`)
+          console.log('[GC] 🖱️ drag static mode:', d.id, d.name, 'pos:', event.x.toFixed(0), event.y.toFixed(0))
           linkContainer.selectAll<SVGLineElement, SimLink>('line')
             .filter(l => {
               const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
@@ -548,6 +872,8 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         }
       })
       .on('end', function (_event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, _d: SimNode) {
+        console.log('[GC] 🖱️ drag end:', _d.name, 'didDrag:', didDrag)
+        setTimeout(() => { didDrag = false }, 0)
         if (simRef.current) {
           simRef.current.alphaTarget(0)
         }
@@ -574,6 +900,20 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
         return nodeMap.get(tid)?.y ?? 0
       })
+
+    // Diagnostic: check if any link endpoints are missing from nodeMap
+    const linkIds = new Set<string>()
+    linkContainer.selectAll<SVGLineElement, SimLink>('line').each(function(d) {
+      const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
+      const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
+      if (!nodeMap.has(sid)) linkIds.add(`missing-source:${sid}`)
+      if (!nodeMap.has(tid)) linkIds.add(`missing-target:${tid}`)
+    })
+    if (linkIds.size > 0) {
+      console.warn('[GC] ⚠️ Link endpoints missing from nodeMap:', [...linkIds])
+    } else {
+      console.log('[GC] ✅ All link endpoints found in nodeMap')
+    }
 
     if (!diagLoggedRef.current) {
       const linkCount = linkContainer.selectAll('line').size()
@@ -793,6 +1133,53 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         height={height}
         style={{ background: '#1a1a2e', display: 'block' }}
       />
+
+      {/* Rich hover tooltip */}
+      {tooltipVisible && (
+        <div
+          style={{
+            position: 'absolute',
+            left: Math.max(0, Math.min(tooltipPos.x, width - 420)),
+            top: Math.max(0, Math.min(tooltipPos.y, height - 100)),
+            zIndex: 1000,
+            maxWidth: 400,
+            maxHeight: 400,
+            overflow: 'auto',
+            background: '#16213e',
+            border: '1px solid #0f3460',
+            borderRadius: 6,
+            padding: '8px 12px',
+            fontSize: 12,
+            lineHeight: 1.5,
+            color: '#ccc',
+            pointerEvents: 'auto',
+            userSelect: 'text',
+            cursor: 'auto',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+          }}
+          onMouseEnter={() => {
+            if (hideTimeoutRef.current) {
+              clearTimeout(hideTimeoutRef.current)
+              hideTimeoutRef.current = null
+            }
+          }}
+          onMouseLeave={() => {
+            hideTimeoutRef.current = setTimeout(() => {
+              setTooltipVisible(false)
+              setTooltipContent(null)
+              setTooltipLoading(false)
+            }, 200)
+          }}
+        >
+          {tooltipLoading ? (
+            <span style={{ color: '#888', fontStyle: 'italic' }}>Loading hover info...</span>
+          ) : tooltipContent ? (
+            renderHoverMarkdown(tooltipContent)
+          ) : (
+            <span style={{ color: '#888', fontStyle: 'italic' }}>No additional info</span>
+          )}
+        </div>
+      )}
 
       <EdgeStateOverlay
         isLoading={isLoadingEdges}

@@ -6,6 +6,8 @@ import type {
   CallHierarchyIncomingCall,
   CallHierarchyOutgoingCall,
   DocumentSymbolParams,
+  Hover,
+  HoverParams,
   CallHierarchyPrepareParams,
   CallHierarchyIncomingCallsParams,
   CallHierarchyOutgoingCallsParams,
@@ -143,6 +145,10 @@ export class LSPClient {
                 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
               ],
             },
+          },
+          hover: {
+            dynamicRegistration: false,
+            contentFormat: ['markdown', 'plaintext'],
           },
         },
       },
@@ -302,6 +308,34 @@ export class LSPClient {
       return (result as CallHierarchyOutgoingCall[]) ?? []
     } catch (err) {
       throw new Error(`Failed to get outgoing calls for ${item.name}: ${err}`)
+    }
+  }
+
+  /**
+   * Get hover information (doc comments + type inference) for a position.
+   * Returns markdown content from rust-analyzer.
+   */
+  async getHover(filePath: string, position: Position): Promise<Hover | null> {
+    const uri = this.filePathToUri(filePath)
+    const params: HoverParams = {
+      textDocument: { uri },
+      position,
+    }
+
+    console.log(`[LSP] getHover: ${uri} line:${position.line} char:${position.character}`)
+
+    try {
+      const result = await this.transport.sendRequest('textDocument/hover', params)
+      if (!result) {
+        console.log(`[LSP] getHover: no result for ${uri}`)
+        return null
+      }
+      const hover = result as Hover
+      console.log(`[LSP] getHover: received response for ${uri}`)
+      return hover
+    } catch (err) {
+      console.error(`[LSP] getHover FAILED: ${err}`)
+      return null
     }
   }
 

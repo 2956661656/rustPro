@@ -2,6 +2,7 @@ import React, { useRef, useEffect } from 'react'
 import * as d3 from 'd3'
 import { useGraphStore } from '../store/useGraphStore'
 import type { FunctionNode, CallEdge } from '../types/graph'
+import { getDisplayName } from '../types/graph'
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -239,12 +240,12 @@ const GraphCanvasStatic: React.FC<GraphCanvasStaticProps> = ({ width, height, on
 
     // Update text
     nodeMerge.select('text')
-      .text(d => d.name)
+      .text(d => getDisplayName(d))
       .attr('dx', d => radiusScale(d.fanIn + d.fanOut) + 4)
 
     // Update tooltip
     nodeMerge.select('title')
-      .text(d => `${d.name}\n${d.filePath}:${d.line}\nmodule: ${d.module}\nfan-in: ${d.fanIn} | fan-out: ${d.fanOut}`)
+      .text(d => `${getDisplayName(d)}\n${d.filePath}:${d.line}\nmodule: ${d.module}\nfan-in: ${d.fanIn} | fan-out: ${d.fanOut}`)
 
     // Fade in new nodes
     nodeEnter.transition().duration(300).attr('opacity', 1)

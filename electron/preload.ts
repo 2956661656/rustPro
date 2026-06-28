@@ -28,8 +28,17 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Complete graph
   getCompleteGraph: (projectPath: string) => ipcRenderer.invoke('get-complete-graph', projectPath),
 
+  // Directory tree
+  getDirectoryTree: (projectPath: string) => ipcRenderer.invoke('get-directory-tree', projectPath),
+
   // Function stats
   getFunctionStats: (nodeJson: string) => ipcRenderer.invoke('get-function-stats', nodeJson),
+
+  // Function source preview
+  getFunctionSource: (nodeJson: string) => ipcRenderer.invoke('get-function-source', nodeJson),
+
+  // Hover info
+  getHoverInfo: (nodeJson: string) => ipcRenderer.invoke('get-hover-info', nodeJson),
 
   // Cleanup
   shutdownLSP: () => ipcRenderer.invoke('shutdown-lsp'),

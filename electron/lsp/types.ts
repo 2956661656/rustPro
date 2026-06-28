@@ -116,6 +116,10 @@ export interface InitializeParams {
           valueSet?: number[]
         }
       }
+      hover?: {
+        dynamicRegistration?: boolean
+        contentFormat?: string[]
+      }
     }
   }
   initializationOptions?: Record<string, unknown>
@@ -145,4 +149,27 @@ export interface LSPMessage {
     message: string
     data?: unknown
   }
+}
+
+// ─── Hover types ───────────────────────────────────────────────
+
+export type MarkupKind = 'plaintext' | 'markdown'
+
+export interface MarkupContent {
+  kind: MarkupKind
+  value: string
+}
+
+export type MarkedString = string | { language: string; value: string }
+
+export interface Hover {
+  contents: MarkupContent | MarkedString | MarkedString[]
+  range?: Range
+}
+
+export interface HoverParams {
+  textDocument: {
+    uri: string
+  }
+  position: Position
 }

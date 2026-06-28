@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useGraphStore } from './store/useGraphStore'
 import { useLSPClient } from './hooks/useLSPClient'
-import { GraphCanvas, SearchBar, ModuleList, ProjectStatus, NavigationHeader, TypeInfo } from './components'
+import { GraphCanvas, SearchBar, ModuleList, ProjectStatus, NavigationHeader, TypeInfo, FunctionPreview, RightPanel } from './components'
+import { getPathHistory, addToPathHistory } from './utils'
 import type { FunctionNode } from './types/graph'
 
 const App: React.FC = () => {
@@ -12,6 +13,7 @@ const App: React.FC = () => {
     error,
     analysisStatus,
     focusNode,
+    currentProjectPath,
   } = useGraphStore()
 
   const {
@@ -21,9 +23,14 @@ const App: React.FC = () => {
   } = useLSPClient()
 
   const [projectPath, setProjectPath] = useState('')
+  const [pathHistory, setPathHistory] = useState<string[]>(() => getPathHistory())
   const [connected, setConnected] = useState(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 })
+  const [previewHeight, setPreviewHeight] = useState(200)
+  const [showPreview, setShowPreview] = useState(true)
+  const [showRightPanel, setShowRightPanel] = useState(false)
+  const [rightPanelMode, setRightPanelMode] = useState<'expanded' | 'minimized'>('expanded')
 
   // Resize observer
   useEffect(() => {
@@ -42,6 +49,13 @@ const App: React.FC = () => {
     return () => observer.disconnect()
   }, [])
 
+  // Reopen preview when navigating to a new node
+  useEffect(() => {
+    if (selectedNodeId) {
+      setShowPreview(true)
+    }
+  }, [selectedNodeId])
+
   // Test connection on mount
   useEffect(() => {
     ping()
@@ -54,6 +68,8 @@ const App: React.FC = () => {
     console.log('[App] analyzeProject:', projectPath.trim())
     try {
       await analyzeProject(projectPath.trim())
+      addToPathHistory(projectPath.trim())
+      setPathHistory(getPathHistory())
     } catch {
       // Error handled in store
     }
@@ -63,6 +79,31 @@ const App: React.FC = () => {
     console.log('[App] handleNodeClick:', node.name, node.filePath)
     focusNode(node.id)
   }, [focusNode])
+
+  const handleToggleRightPanel = useCallback(() => {
+    if (showRightPanel) {
+      setShowRightPanel(false)
+    } else {
+      setShowRightPanel(true)
+      setRightPanelMode('expanded')
+    }
+  }, [showRightPanel])
+
+  const handleMinimizeRightPanel = useCallback(() => {
+    setRightPanelMode('minimized')
+  }, [])
+
+  const handleCloseRightPanel = useCallback(() => {
+    setShowRightPanel(false)
+  }, [])
+
+  const handleMinimizedClick = useCallback(() => {
+    setRightPanelMode('expanded')
+  }, [])
+
+  const graphHeight = (analysisStatus === 'ready' && selectedNodeId && showPreview)
+    ? dimensions.height - previewHeight
+    : dimensions.height
 
   return (
     <div className="app">
@@ -77,7 +118,13 @@ const App: React.FC = () => {
             onChange={e => setProjectPath(e.target.value)}
             onKeyDown={e => e.key === 'Enter' && handleAnalyze()}
             className="path-input"
+            list="path-history"
           />
+          <datalist id="path-history">
+            {pathHistory.map(path => (
+              <option key={path} value={path} />
+            ))}
+          </datalist>
           <button onClick={handleAnalyze} disabled={isLoading}>
             {isLoading ? 'Analyzing...' : 'Analyze'}
           </button>
@@ -90,6 +137,13 @@ const App: React.FC = () => {
         <span className={`status ${connected ? 'connected' : ''}`}>
           {connected ? 'LSP ready' : 'disconnected'}
         </span>
+        <button
+          className={`btn-icon right-panel-toggle ${showRightPanel ? 'active' : ''}`}
+          onClick={handleToggleRightPanel}
+          title={showRightPanel ? 'Hide file tree' : 'Show file tree'}
+        >
+          📁
+        </button>
       </header>
 
       {/* Error toast */}
@@ -121,20 +175,50 @@ const App: React.FC = () => {
           )}
 
           {analysisStatus === 'ready' && selectedNodeId && (
-            <NavigationHeader />
-          )}
-          {analysisStatus === 'ready' && selectedNodeId && (
-            <TypeInfo node={nodes.find(n => n.id === selectedNodeId) ?? null} />
-          )}
-          {analysisStatus === 'ready' && selectedNodeId && dimensions.width > 0 && (
-            <GraphCanvas
-              width={dimensions.width}
-              height={dimensions.height}
-              focusNodeId={selectedNodeId}
-              onNodeClick={handleNodeClick}
-            />
+            <div style={{ display: 'flex', flexDirection: 'column', height: '100%', width: '100%' }}>
+              {/* Top: Graph with navigation and type info */}
+              <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+                <NavigationHeader />
+                <TypeInfo node={nodes.find(n => n.id === selectedNodeId) ?? null} />
+                  {dimensions.width > 0 && (
+                    <GraphCanvas
+                      width={dimensions.width}
+                      height={graphHeight}
+                      focusNodeId={selectedNodeId}
+                      onNodeClick={handleNodeClick}
+                    />
+                  )}
+              </div>
+              {/* Bottom: Function Preview */}
+              {showPreview && (
+                <FunctionPreview
+                  node={nodes.find(n => n.id === selectedNodeId) ?? null}
+                  defaultHeight={200}
+                  onHeightChange={setPreviewHeight}
+                  onClose={() => setShowPreview(false)}
+                />
+              )}
+            </div>
           )}
         </main>
+
+        {/* Right panel */}
+        {showRightPanel && (
+          <RightPanel
+            projectPath={currentProjectPath}
+            mode={rightPanelMode}
+            onClose={handleCloseRightPanel}
+            onMinimize={handleMinimizeRightPanel}
+          />
+        )}
+        {!showRightPanel && rightPanelMode === 'minimized' && (
+          <RightPanel
+            projectPath={currentProjectPath}
+            mode="minimized"
+            onClose={handleCloseRightPanel}
+            onMinimize={handleMinimizedClick}
+          />
+        )}
       </div>
     </div>
   )

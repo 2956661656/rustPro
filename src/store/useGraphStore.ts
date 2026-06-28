@@ -20,6 +20,7 @@ export interface GraphState {
   currentProjectPath: string | null
   analysisStatus: 'idle' | 'analyzing' | 'ready' | 'error'
   showExternal: boolean
+  fileFilter: string | null
 
   // Actions
   setGraphData: (data: { nodes: FunctionNode[]; edges: CallEdge[]; stats: CallGraphData['stats'] }) => void
@@ -39,6 +40,7 @@ export interface GraphState {
   setAnalysisStatus: (status: 'idle' | 'analyzing' | 'ready' | 'error') => void
   setShowExternal: (value: boolean) => void
   toggleShowExternal: () => void
+  setFileFilter: (path: string | null) => void
   clearGraph: () => void
   reset: () => void
 }
@@ -59,6 +61,7 @@ const initialState = {
   currentProjectPath: null,
   analysisStatus: 'idle' as const,
   showExternal: false,
+  fileFilter: null,
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -176,6 +179,10 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     showExternal: !state.showExternal,
   })),
 
+  setFileFilter: (path) => set({
+    fileFilter: path,
+  }),
+
   clearGraph: () => set({
     nodes: [],
     edges: [],
@@ -185,6 +192,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     highlightedNodeIds: [],
     searchResults: [],
     showExternal: false,
+    fileFilter: null,
     analysisStatus: 'idle',
     error: null,
   }),

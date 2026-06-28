@@ -1,5 +1,6 @@
 import React, { useState } from 'react'
 import type { FunctionNode } from '../types/graph'
+import { getDisplayName } from '../types/graph'
 
 interface TypeInfoProps {
   node: FunctionNode | null
@@ -47,7 +48,7 @@ const ROW_STYLE: React.CSSProperties = {
 function buildSignature(node: FunctionNode): string {
   const params = node.parameterTypes.length > 0 ? node.parameterTypes.join(', ') : ''
   const ret = node.returnType ? ` -> ${node.returnType}` : ''
-  return `fn ${node.name}(${params})${ret}`
+  return `fn ${getDisplayName(node)}(${params})${ret}`
 }
 
 const TypeInfo: React.FC<TypeInfoProps> = ({ node }) => {

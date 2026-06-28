@@ -1,7 +1,8 @@
 import { LSPClient } from './lsp/client'
+import { SymbolKind } from './lsp/types'
 import type { CallHierarchyItem, CallHierarchyIncomingCall, CallHierarchyOutgoingCall, Position } from './lsp/types'
 import { ProjectScanner, ScannedFile } from './scanner'
-import type { FunctionNode, CallEdge, CallGraphData } from '../src/types/graph'
+import type { FunctionNode, CallEdge, CallGraphData, TraitKind } from '../src/types/graph'
 import * as path from 'path'
 import { fileURLToPath } from 'url'
 
@@ -122,7 +123,7 @@ export class GraphBuilder {
    * Recursively extract function nodes from document symbols.
    * DocumentSymbol in LSP can have nested children (e.g., impl blocks with methods).
    */
-  private extractNodesFromSymbols(symbols: any[], file: ScannedFile): FunctionNode[] {
+  private extractNodesFromSymbols(symbols: any[], file: ScannedFile, parentTraitKind?: TraitKind): FunctionNode[] {
     const nodes: FunctionNode[] = []
 
     for (const symbol of symbols) {
@@ -144,13 +145,26 @@ export class GraphBuilder {
           detail: symbol.detail,
           parameterTypes: typeInfo.parameterTypes,
           returnType: typeInfo.returnType,
+          endLine: symbol.range?.end?.line,
+          endCharacter: symbol.range?.end?.character,
+          traitKind: parentTraitKind ?? 'none',
         }
         nodes.push(node)
       }
 
       // Recurse into children (e.g., impl blocks, nested modules)
-      if (symbol.children && Array.isArray(symbol.children)) {
-        nodes.push(...this.extractNodesFromSymbols(symbol.children, file))
+      if (Array.isArray(symbol.children)) {
+        // Determine trait context for children of this symbol
+        let childCtx: TraitKind = parentTraitKind ?? 'none'
+        // parent is a trait definition (Interface = 11)
+        if (symbol.kind === SymbolKind.Interface) {
+          childCtx = 'definition'
+        }
+        // parent is a trait impl (Class, name contains "for" as a word)
+        else if (symbol.kind === SymbolKind.Class && typeof symbol.name === 'string' && /\bfor\b/.test(symbol.name)) {
+          childCtx = 'implementation'
+        }
+        nodes.push(...this.extractNodesFromSymbols(symbol.children, file, childCtx))
       }
     }
 
@@ -161,7 +175,7 @@ export class GraphBuilder {
    * Check if a symbol kind is a function or method.
    */
   private isFunctionOrMethod(kind: number): boolean {
-    return kind === 12 || kind === 6 // SymbolKind.Function = 12, SymbolKind.Method = 6
+    return kind === SymbolKind.Function || kind === SymbolKind.Method
   }
 
   /**
@@ -459,6 +473,9 @@ export class GraphBuilder {
       detail: item.detail,
       parameterTypes: typeInfo.parameterTypes,
       returnType: typeInfo.returnType,
+      endLine: item.range?.end?.line,
+      endCharacter: item.range?.end?.character,
+      traitKind: 'none' as TraitKind,
     }
   }
 }
