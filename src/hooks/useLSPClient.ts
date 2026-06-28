@@ -147,6 +147,50 @@ export function useLSPClient() {
   }, [api, addEdges, addNodes])
 
   /**
+   * Recursively load edges for a node and its transitive neighbors up to `maxDepth` levels.
+   * Reports progress via the optional `onProgress` callback.
+   */
+  const loadEdgesRecursively = useCallback(async (
+    rootNode: FunctionNode,
+    maxDepth: number = 5,
+    onProgress?: (level: number, maxDepth: number, nodeCount: number) => void,
+  ): Promise<void> => {
+    // Seed with already-loaded node IDs to avoid redundant work across focus changes
+    const loadedIds = new Set(useGraphStore.getState().loadedNodeIds)
+    let currentLevelNodes: FunctionNode[] = [rootNode]
+
+    for (let depth = 1; depth <= maxDepth; depth++) {
+      // Filter to nodes whose edges haven't been fetched yet
+      const toLoad = currentLevelNodes.filter(n => !loadedIds.has(n.id))
+      if (toLoad.length === 0) break
+
+      // Report progress
+      onProgress?.(depth, maxDepth, toLoad.length)
+
+      // Fetch edges for this level (batch RPC — adds edges + new nodes to store)
+      await loadEdgesForNodes(toLoad)
+
+      // Mark these nodes as loaded in local session and persisted store
+      for (const n of toLoad) loadedIds.add(n.id)
+      useGraphStore.getState().markNodesLoaded(toLoad.map(n => n.id))
+
+      // Discover new neighbor nodes from the updated edge set
+      const state = useGraphStore.getState()
+      const neighborIds = new Set<string>()
+      for (const edge of state.edges) {
+        if (loadedIds.has(edge.source) && !loadedIds.has(edge.target)) neighborIds.add(edge.target)
+        if (loadedIds.has(edge.target) && !loadedIds.has(edge.source)) neighborIds.add(edge.source)
+      }
+
+      // Filter to user-code nodes only (skip external/stdlib)
+      currentLevelNodes = state.nodes.filter(n => neighborIds.has(n.id) && n.isUserCode !== false)
+
+      // No more reachable user-code nodes to explore
+      if (currentLevelNodes.length === 0) break
+    }
+  }, [loadEdgesForNodes])
+
+  /**
    * Build the complete graph (all nodes + all edges).
    */
   const buildCompleteGraph = useCallback(async (projectPath: string) => {
@@ -194,6 +238,7 @@ export function useLSPClient() {
     analyzeProject,
     loadEdgesForNode,
     loadEdgesForNodes,
+    loadEdgesRecursively,
     buildCompleteGraph,
     shutdownLSP,
     getHoverInfo,

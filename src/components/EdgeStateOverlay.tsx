@@ -7,6 +7,7 @@ interface EdgeStateOverlayProps {
   edgeCount: number
   focusNodeName: string
   onRetry: () => void
+  loadingMessage?: string
 }
 
 const EdgeStateOverlay: React.FC<EdgeStateOverlayProps> = ({
@@ -16,14 +17,15 @@ const EdgeStateOverlay: React.FC<EdgeStateOverlayProps> = ({
   edgeCount,
   focusNodeName,
   onRetry,
+  loadingMessage,
 }) => {
-  // ── State 1: Loading with only focus node ──────────────────────
-  if (isLoading && nodeCount <= 1) {
+  // ── State 1: Loading (initial or recursive) ────────────────────
+  if (isLoading) {
     return (
       <div className="edge-state-overlay">
         <div className="edge-state-spinner" />
         <div className="edge-state-msg">
-          Loading call relations for {focusNodeName}...
+          {loadingMessage || `Loading call relations for ${focusNodeName}...`}
         </div>
       </div>
     )

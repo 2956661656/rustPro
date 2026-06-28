@@ -199,6 +199,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
   // Loading / error state for edge fetching
   const [isLoadingEdges, setIsLoadingEdges] = useState(false)
   const [edgeError, setEdgeError] = useState<string | null>(null)
+  const [edgeLoadingMessage, setEdgeLoadingMessage] = useState('')
 
   // ── Tooltip / hover state ──
   const [tooltipVisible, setTooltipVisible] = useState(false)
@@ -210,6 +211,49 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
   const hoveredNodeIdRef = useRef<string | null>(null)
   const hideTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
+  // Peek refs
+  const hoverPeekTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const nodePositionsRef = useRef<Map<string, {x: number; y: number}>>(new Map())
+  const didDragRef = useRef(false)
+  const isFirstFocusRef = useRef(true)
+  const tooltipPosInitializedRef = useRef(false)
+
+  // Compute opposite-corner position from mouse (used during drag)
+  const computeRepelPos = useCallback((clientX: number, clientY: number): { x: number; y: number } => {
+    const container = svgRef.current?.parentElement
+    if (!container) return { x: 0, y: 0 }
+    const rect = container.getBoundingClientRect()
+    const w = rect.width
+    const h = rect.height
+    const relX = clientX - rect.left
+    const relY = clientY - rect.top
+    const left = relX > w / 2   // mouse on right → put on left
+    const top = relY > h / 2    // mouse on bottom → put on top
+    return { x: left ? 12 : w - 412, y: top ? 12 : h - 412 }
+  }, [])
+
+  // Edge shortening: line endpoints are pulled back so arrow tips clear node circles
+  const GAP_MAIN = 9   // node radius(6) + outside gap(3)
+  const GAP_PEEK = 6   // peek node radius(4) + outside gap(2)
+  const shortenTarget = useCallback(
+    (sx: number, sy: number, tx: number, ty: number, amount: number): { x: number; y: number } => {
+      const dx = tx - sx
+      const dy = ty - sy
+      const len = Math.sqrt(dx * dx + dy * dy)
+      if (len < 0.001) return { x: tx, y: ty }
+      return { x: tx - (dx / len) * amount, y: ty - (dy / len) * amount }
+    },
+    []
+  )
+
+  // Peek state from store
+  const peekStack = useGraphStore(s => s.peekStack)
+  const transientPeekNodeId = useGraphStore(s => s.transientPeekNodeId)
+  const pushPeek = useGraphStore(s => s.pushPeek)
+  const popToPeek = useGraphStore(s => s.popToPeek)
+  const setTransientPeekNode = useGraphStore(s => s.setTransientPeekNode)
+  const clearAllPeeks = useGraphStore(s => s.clearAllPeeks)
+
   // Store subscriptions
   const nodes = useGraphStore(s => s.nodes)
   const edges = useGraphStore(s => s.edges)
@@ -219,7 +263,36 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
   const showExternal = useGraphStore(s => s.showExternal)
 
   // LSP client for on-demand edge loading
-  const { loadEdgesForNode, getHoverInfo } = useLSPClient()
+  const { loadEdgesRecursively, getHoverInfo } = useLSPClient()
+
+  // Shared helper: load edges with progress and stale-navigation guards
+  const loadEdgesWithProgress = useCallback((nodeId: string) => {
+    setEdgeError(null)
+    setIsLoadingEdges(true)
+    setEdgeLoadingMessage('Loading edges (level 1/5)...')
+
+    const node = useGraphStore.getState().nodes.find(n => n.id === nodeId)
+    if (!node) {
+      setIsLoadingEdges(false)
+      setEdgeLoadingMessage('')
+      return
+    }
+
+    loadEdgesRecursively(node, 5, (level, maxDepth, nodeCount) => {
+      setEdgeLoadingMessage(`Loading edges (level ${level}/${maxDepth}) — ${nodeCount} nodes...`)
+    })
+      .then(() => {
+        if (useGraphStore.getState().selectedNodeId !== nodeId) return
+        setIsLoadingEdges(false)
+        setEdgeLoadingMessage('')
+      })
+      .catch((err: unknown) => {
+        if (useGraphStore.getState().selectedNodeId !== nodeId) return
+        setEdgeError(err instanceof Error ? err.message : String(err))
+        setIsLoadingEdges(false)
+        setEdgeLoadingMessage('')
+      })
+  }, [loadEdgesRecursively])
 
   // ── Effect 1a: Initialize SVG, zoom, groups (runs ONCE) ──────────
   useEffect(() => {
@@ -241,7 +314,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     defs.append('marker')
       .attr('id', 'arrow')
       .attr('viewBox', '0 -6 12 12')
-      .attr('refX', 10)
+      .attr('refX', 12)
       .attr('refY', 0)
       .attr('markerWidth', 10)
       .attr('markerHeight', 10)
@@ -287,33 +360,90 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     svg.call(zoomRef.current.transform, d3.zoomIdentity.translate(width / 2, height / 2).scale(0.8))
   }, [width, height])
 
-  // ── Effect: Edge loading on focus change ─────────────────────────
+  // ── Effect: SVG blur filters for peek layers (stable, never torn down) ──
+  useEffect(() => {
+    if (analysisStatus !== 'ready') return
+    const svg = d3.select(svgRef.current)
+    if (svg.empty()) return
+    // Use a separate defs group so Effect 1a's svg.selectAll('defs').remove() doesn't affect it
+    const defs = svg.append('defs').attr('class', 'peek-defs')
+    const blurLevels = [
+      { id: 'peek-blur-1', stdDev: 0.5 },
+      { id: 'peek-blur-2', stdDev: 1.2 },
+      { id: 'peek-blur-3', stdDev: 2.0 },
+    ]
+    for (const { id, stdDev } of blurLevels) {
+      const filter = defs.append('filter').attr('id', id)
+      filter.append('feGaussianBlur').attr('stdDeviation', stdDev)
+    }
+
+    // Add arrow marker for peek edges (userSpaceOnUse so it doesn't scale with stroke-width)
+    const arrowMarker = defs.append('marker')
+      .attr('id', 'peek-arrow')
+      .attr('viewBox', '0 -5 10 10')
+      .attr('refX', 10)
+      .attr('refY', 0)
+      .attr('markerWidth', 8)
+      .attr('markerHeight', 8)
+      .attr('markerUnits', 'userSpaceOnUse')
+      .attr('orient', 'auto')
+    arrowMarker.append('path')
+      .attr('d', 'M0,-4L10,0L0,4')
+      .attr('fill', '#aaa')
+    return () => { defs.remove() }
+  }, [analysisStatus])
+
+  // ── Effect: SVG event delegation for right-click on ALL nodes (main + peek) ──
+  useEffect(() => {
+    if (analysisStatus !== 'ready') return
+    if (!svgRef.current) return
+
+    const svg = d3.select(svgRef.current)
+
+    function getNodeId(event: MouseEvent): string | null {
+      const target = event.target as Element
+      const nodeEl = target.closest('.node, .peek-node') as Element | null
+      if (!nodeEl) return null
+      const datum = d3.select(nodeEl).datum() as Record<string, unknown> | undefined
+      if (!datum) return null
+      return (datum.id as string) ?? null
+    }
+
+    // ── Context menu: right-click toggle persistent peek ──
+    svg.on('contextmenu.peek-global', (event: MouseEvent) => {
+      event.preventDefault()
+      const nodeId = getNodeId(event)
+      if (!nodeId || nodeId === focusNodeId) return
+
+      // Cancel any pending hover peek
+      if (hoverPeekTimerRef.current !== null) {
+        clearTimeout(hoverPeekTimerRef.current)
+        hoverPeekTimerRef.current = null
+      }
+      setTransientPeekNode(null)  // clear transient
+
+      const state = useGraphStore.getState()
+      const idx = state.peekStack.indexOf(nodeId)
+      if (idx !== -1) {
+        // Already persistent — dismiss this level and all deeper
+        state.popToPeek(nodeId)
+      } else {
+        // Not persistent — push to stack
+        state.pushPeek(nodeId)
+      }
+    })
+
+    return () => {
+      svg.on('contextmenu.peek-global', null)
+    }
+  }, [analysisStatus, focusNodeId, setTransientPeekNode, pushPeek, popToPeek])
+
+  // ── Effect: Recursive edge loading on focus change ──────────────
   useEffect(() => {
     if (!focusNodeId) return
     if (analysisStatus !== 'ready') return
-
-    // Clear previous error when focus changes
-    setEdgeError(null)
-
-    const state = useGraphStore.getState()
-    const focusNode = state.nodes.find(n => n.id === focusNodeId)
-    if (!focusNode) return
-
-    setIsLoadingEdges(true)
-
-    loadEdgesForNode(focusNode)
-      .then(() => {
-        // Abandon result if user navigated away while loading
-        if (useGraphStore.getState().selectedNodeId !== focusNodeId) return
-        setIsLoadingEdges(false)
-      })
-      .catch((err: unknown) => {
-        // Abandon stale error if user navigated away
-        if (useGraphStore.getState().selectedNodeId !== focusNodeId) return
-        setEdgeError(err instanceof Error ? err.message : String(err))
-        setIsLoadingEdges(false)
-      })
-  }, [focusNodeId, analysisStatus, loadEdgesForNode])
+    loadEdgesWithProgress(focusNodeId)
+  }, [focusNodeId, analysisStatus, loadEdgesWithProgress])
 
   // ── Effect 2: Focus subgraph simulation ──────────────────────────
   useEffect(() => {
@@ -353,6 +483,9 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     prevEffectKeyRef.current = effectKey
     diagLoggedRef.current = false
 
+    // Clear stale node positions from previous graph render
+    nodePositionsRef.current.clear()
+
     // Diagnostic: check for duplicate node IDs in subgraph
     const subgraphIdSet = new Set<string>()
     const subgraphDuplicates: string[] = []
@@ -370,9 +503,6 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
     const mode = selectLayoutMode(subgraphNodes.length)
     console.log('[GC] Layout mode:', mode, 'nodes:', subgraphNodes.length)
-
-    // ── Drag-guard flag: prevents click from firing after drag ends ──
-    let didDrag = false
 
     // ── Build sim data with layout-specific positions ──
     let simNodes: SimNode[]
@@ -695,16 +825,16 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
     // ── Click handler ──
     nodeMerge.on('click', (_event, d) => {
-      console.log('[GC] 👆 click fired:', d.name, 'didDrag:', didDrag, 'hasCallback:', !!stableOnClickRef.current)
-      if (didDrag) {
-        console.log('[GC] ⛔ click suppressed by didDrag')
+      if (didDragRef.current) {
         return  // skip click events that follow a drag
       }
+
+      // Clear peek state on navigation
+      clearAllPeeks()
 
       // Only use the stable callback for navigation — it routes through App.tsx's handleNodeClick
       // which calls focusNode via the store. This avoids double-focusNode calls.
       setIsLoadingEdges(false)
-      console.log('[GC] ✅ click will call callback:', d.name, d.id)
       if (stableOnClickRef.current) {
         stableOnClickRef.current(d)
       }
@@ -718,39 +848,28 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         hideTimeoutRef.current = null
       }
 
-      // Position tooltip dynamically away from the cursor to avoid covering nodes
-      const container = svgRef.current?.parentElement
-      if (container) {
-        const rect = container.getBoundingClientRect()
-        const mouseX = event.clientX - rect.left
-        const mouseY = event.clientY - rect.top
-
-        // Tooltip estimated dimensions
-        const tooltipW = Math.min(400, rect.width * 0.6)
-        const tooltipH = Math.min(350, rect.height * 0.5)
-
-        // Choose direction: expand toward the larger empty space
-        const spaceRight = rect.width - mouseX
-        const spaceLeft = mouseX
-        const spaceBelow = rect.height - mouseY
-        const spaceAbove = mouseY
-
-        // Prefer the direction with more space, flip if not enough room
-        const goRight = spaceRight > spaceLeft
-        const goDown = spaceBelow > spaceAbove
-
-        const x = goRight
-          ? Math.min(mouseX + 14, rect.width - tooltipW - 6)
-          : Math.max(6, mouseX - tooltipW - 14)
-        const y = goDown
-          ? Math.min(mouseY + 14, rect.height - tooltipH - 6)
-          : Math.max(6, mouseY - tooltipH - 14)
-
-        setTooltipPos({ x, y })
+      // On first hover, initialize tooltip to bottom-right corner
+      if (!tooltipPosInitializedRef.current) {
+        const container = svgRef.current?.parentElement
+        if (container) {
+          const rect = container.getBoundingClientRect()
+          setTooltipPos({ x: rect.width - 412, y: rect.height - 412 })
+        }
+        tooltipPosInitializedRef.current = true
       }
+      // Otherwise: keep current position (never reset on normal hover)
 
       hoveredNodeIdRef.current = d.id
       setTooltipVisible(true)
+
+      // Start hover peek timer (transient third-layer)
+      if (hoverPeekTimerRef.current !== null) {
+        clearTimeout(hoverPeekTimerRef.current)
+      }
+      hoverPeekTimerRef.current = setTimeout(() => {
+        setTransientPeekNode(d.id)
+        hoverPeekTimerRef.current = null
+      }, 200)
 
       // Check cache first
       const cache = tooltipCacheRef.current
@@ -771,12 +890,10 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         .then(result => {
           if (result.found && result.markdown) {
             cache.set(d.id, result.markdown)
-            // Only set state if still hovering this node
             if (hoveredNodeIdRef.current === d.id) {
               setTooltipContent(result.markdown)
             }
           } else {
-            // Fallback: show basic info as fallback markdown
             const fallback = [
               `**${getDisplayName(d)}**`,
               '',
@@ -808,12 +925,19 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         hoveredNodeIdRef.current = null
       }
 
+      // Cancel hover peek timer if pending, or dismiss transient
+      if (hoverPeekTimerRef.current !== null) {
+        clearTimeout(hoverPeekTimerRef.current)
+        hoverPeekTimerRef.current = null
+      }
+      setTransientPeekNode(null)
+
       // Small delay to avoid flicker when moving between adjacent nodes
       hideTimeoutRef.current = setTimeout(() => {
         setTooltipVisible(false)
         setTooltipContent(null)
         setTooltipLoading(false)
-      }, 300)
+      }, 800)
     })
 
     // Set initial positions immediately (before simulation starts)
@@ -823,7 +947,11 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
     const drag = d3.drag<SVGGElement, SimNode>()
       .clickDistance(3)
       .on('start', function (this: SVGGElement, event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, d: SimNode) {
-        didDrag = false
+        didDragRef.current = false
+        const se = event.sourceEvent as MouseEvent | undefined
+        if (se) {
+          setTooltipPos(computeRepelPos(se.clientX, se.clientY))
+        }
         console.log('[GC] 🖱️ drag start:', d.name, 'at', event.x.toFixed(0), event.y.toFixed(0))
         // Store drag start position on the element for distance check
         d3.select(this).attr('data-drag-x', event.x).attr('data-drag-y', event.y)
@@ -847,7 +975,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         console.log('[GC] 🖱️ drag move:', d.name, 'dist²:', (dx*dx + dy*dy).toFixed(1))
         if (!isNaN(startX) && !isNaN(startY)) {
           if (dx * dx + dy * dy > 9) {
-            didDrag = true
+            didDragRef.current = true
           }
         }
         d.fx = event.x
@@ -873,18 +1001,62 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
               return nodeMap.get(sid)?.y ?? 0
             })
             .attr('x2', l => {
+              const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
               const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
-              return nodeMap.get(tid)?.x ?? 0
+              const src = nodeMap.get(sid)
+              const tgt = nodeMap.get(tid)
+              if (!src || !tgt) return 0
+              return shortenTarget(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, GAP_MAIN).x
             })
             .attr('y2', l => {
+              const sid = typeof l.source === 'string' ? l.source : (l.source as SimNode).id
               const tid = typeof l.target === 'string' ? l.target : (l.target as SimNode).id
-              return nodeMap.get(tid)?.y ?? 0
+              const src = nodeMap.get(sid)
+              const tgt = nodeMap.get(tid)
+              if (!src || !tgt) return 0
+              return shortenTarget(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, GAP_MAIN).y
             })
+        }
+
+        // Update nodePositionsRef with new position
+        nodePositionsRef.current.set(d.id, { x: d.x!, y: d.y! })
+
+        // Update tooltip to repel from mouse during drag
+        const se = event.sourceEvent as MouseEvent | undefined
+        if (se) {
+          setTooltipPos(computeRepelPos(se.clientX, se.clientY))
+        }
+
+        // Reposition peek children to follow parent
+        const g = gRef.current
+        if (g) {
+          // Update peek node positions (children follow parent)
+          g.selectAll<SVGGElement, unknown>(`.peek-node[data-parent-id="${d.id}"]`).each(function() {
+            const el = d3.select(this)
+            const ox = parseFloat(el.attr('data-offset-x') ?? '0')
+            const oy = parseFloat(el.attr('data-offset-y') ?? '0')
+            const newX = d.x! + ox
+            const newY = d.y! + oy
+            el.attr('transform', `translate(${newX}, ${newY})`)
+            // Update edges connected to THIS peek child (its position relative to parent changed)
+            const nodeId = el.attr('data-node-id')
+            if (nodeId) {
+              g.selectAll<SVGLineElement, unknown>(`.peek-edge[data-source="${nodeId}"]`)
+                .attr('x1', newX).attr('y1', newY)
+              g.selectAll<SVGLineElement, unknown>(`.peek-edge[data-target="${nodeId}"]`)
+                .attr('x2', newX).attr('y2', newY)
+            }
+          })
+          // Update peek edges connected to this node (the dragged parent)
+          g.selectAll<SVGLineElement, unknown>(`.peek-edge[data-source="${d.id}"]`)
+            .attr('x1', d.x!).attr('y1', d.y!)
+          g.selectAll<SVGLineElement, unknown>(`.peek-edge[data-target="${d.id}"]`)
+            .attr('x2', d.x!).attr('y2', d.y!)
         }
       })
       .on('end', function (_event: d3.D3DragEvent<SVGGElement, SimNode, SimNode>, _d: SimNode) {
-        console.log('[GC] 🖱️ drag end:', _d.name, 'didDrag:', didDrag)
-        setTimeout(() => { didDrag = false }, 0)
+        console.log('[GC] 🖱️ drag end:', _d.name, 'didDrag:', didDragRef.current)
+        setTimeout(() => { didDragRef.current = false }, 0)
         if (simRef.current) {
           simRef.current.alphaTarget(0)
         }
@@ -904,12 +1076,20 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         return nodeMap.get(sid)?.y ?? 0
       })
       .attr('x2', d => {
+        const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
         const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-        return nodeMap.get(tid)?.x ?? 0
+        const src = nodeMap.get(sid)
+        const tgt = nodeMap.get(tid)
+        if (!src || !tgt) return 0
+        return shortenTarget(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, GAP_MAIN).x
       })
       .attr('y2', d => {
+        const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
         const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-        return nodeMap.get(tid)?.y ?? 0
+        const src = nodeMap.get(sid)
+        const tgt = nodeMap.get(tid)
+        if (!src || !tgt) return 0
+        return shortenTarget(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, GAP_MAIN).y
       })
 
     // Diagnostic: check if any link endpoints are missing from nodeMap
@@ -941,8 +1121,16 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
       linkContainer.selectAll<SVGLineElement, SimLink>('line')
         .attr('x1', d => (d.source as SimNode).x!)
         .attr('y1', d => (d.source as SimNode).y!)
-        .attr('x2', d => (d.target as SimNode).x!)
-        .attr('y2', d => (d.target as SimNode).y!)
+        .attr('x2', d => {
+          const src = d.source as SimNode
+          const tgt = d.target as SimNode
+          return shortenTarget(src.x!, src.y!, tgt.x!, tgt.y!, GAP_MAIN).x
+        })
+        .attr('y2', d => {
+          const src = d.source as SimNode
+          const tgt = d.target as SimNode
+          return shortenTarget(src.x!, src.y!, tgt.x!, tgt.y!, GAP_MAIN).y
+        })
 
       if (!diagLoggedRef.current) {
         const linkCount = linkContainer.selectAll('line').size()
@@ -952,6 +1140,11 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
       nodeContainer.selectAll<SVGGElement, SimNode>('.node')
         .attr('transform', d => `translate(${d.x},${d.y})`)
+
+      // Update position tracking
+      nodeContainer.selectAll<SVGGElement, SimNode>('.node').each(function(d) {
+        nodePositionsRef.current.set(d.id, { x: d.x ?? 0, y: d.y ?? 0 })
+      })
     }
 
     if (mode === 'force') {
@@ -992,17 +1185,30 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         return nodeMap.get(sid)?.y ?? 0
       })
       .attr('x2', d => {
+        const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
         const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-        return nodeMap.get(tid)?.x ?? 0
+        const src = nodeMap.get(sid)
+        const tgt = nodeMap.get(tid)
+        if (!src || !tgt) return 0
+        return shortenTarget(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, GAP_MAIN).x
       })
       .attr('y2', d => {
+        const sid = typeof d.source === 'string' ? d.source : (d.source as SimNode).id
         const tid = typeof d.target === 'string' ? d.target : (d.target as SimNode).id
-        return nodeMap.get(tid)?.y ?? 0
+        const src = nodeMap.get(sid)
+        const tgt = nodeMap.get(tid)
+        if (!src || !tgt) return 0
+        return shortenTarget(src.x ?? 0, src.y ?? 0, tgt.x ?? 0, tgt.y ?? 0, GAP_MAIN).y
       })
 
     // Position nodes
     nodeContainer.selectAll<SVGGElement, SimNode>('.node')
       .attr('transform', d => `translate(${d.x},${d.y})`)
+
+    // Update position tracking
+    nodeContainer.selectAll<SVGGElement, SimNode>('.node').each(function(d) {
+      nodePositionsRef.current.set(d.id, { x: d.x ?? 0, y: d.y ?? 0 })
+    })
 
     if (!diagLoggedRef.current) {
       const linkCount = linkContainer.selectAll('line').size()
@@ -1118,30 +1324,284 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
 
   // ── Retry handler for error overlay ──────────────────────────────
   const handleRetry = useCallback(() => {
-    setEdgeError(null)
-    setIsLoadingEdges(true)
+    const currentFocusId = useGraphStore.getState().selectedNodeId
+    if (!currentFocusId) return
+    loadEdgesWithProgress(currentFocusId)
+  }, [loadEdgesWithProgress])
+
+  // ── Effect 4: Recursive peek rendering ────────────────────────────────
+  useEffect(() => {
+    if (analysisStatus !== 'ready') return
+    if (!gRef.current) return
+    if (!focusNodeId) {
+      gRef.current.selectAll('.peek-group').remove()
+      gRef.current.selectAll('.peek-links-group').remove()
+      return
+    }
+
+    const g = gRef.current
     const state = useGraphStore.getState()
-    const currentFocusId = state.selectedNodeId
-    if (!currentFocusId) {
-      setIsLoadingEdges(false)
+    const { nodes: stateNodes, edges: stateEdges, showExternal: stShowExternal } = state
+    const sPeekStack = state.peekStack
+    const sTransientPeekNodeId = state.transientPeekNodeId
+
+    // Early exit: nothing to show
+    if (sPeekStack.length === 0 && !sTransientPeekNodeId) {
+      g.selectAll('.peek-group').remove()
+      g.selectAll('.peek-links-group').remove()
       return
     }
-    const focusNode = state.nodes.find(n => n.id === currentFocusId)
-    if (!focusNode) {
-      setIsLoadingEdges(false)
+
+    // Step 1: Build base node IDs (focus + its direct callers/callees)
+    const baseNodeIds = new Set<string>([focusNodeId])
+    for (const e of stateEdges) {
+      if (e.source === focusNodeId || e.target === focusNodeId) {
+        if (stShowExternal || !e.isExternal) {
+          baseNodeIds.add(e.source)
+          baseNodeIds.add(e.target)
+        }
+      }
+    }
+
+    // Step 2: Build peek levels from peekStack + transient
+    const allLevels: Array<{parentId: string; depth: number; isTransient: boolean}> = []
+    sPeekStack.forEach((id, i) => allLevels.push({ parentId: id, depth: i + 1, isTransient: false }))
+    if (sTransientPeekNodeId) {
+      allLevels.push({ parentId: sTransientPeekNodeId, depth: sPeekStack.length + 1, isTransient: true })
+    }
+
+    // Step 3: Collect peek nodes and edges
+    const posMap = nodePositionsRef.current
+    const allPeekNodeIds = new Set<string>()
+    const peekNodes: Array<{ nodeId: string; id: string; parentId: string; depth: number; isTransient: boolean; node: FunctionNode | undefined }> = []
+    const peekEdges: Array<{ source: string; target: string; depth: number }> = []
+
+    for (const level of allLevels) {
+      const parentPos = posMap.get(level.parentId)
+      if (!parentPos) continue
+
+      const levelEdges = stateEdges.filter(e =>
+        (e.source === level.parentId || e.target === level.parentId) &&
+        (stShowExternal || !e.isExternal)
+      )
+
+      // Collect child IDs
+      const childIds: string[] = []
+      for (const e of levelEdges) {
+        const childId = e.source === level.parentId ? e.target : e.source
+        if (!baseNodeIds.has(childId) && !allPeekNodeIds.has(childId)) {
+          childIds.push(childId)
+          allPeekNodeIds.add(childId)
+        }
+      }
+
+      // Cap at 50
+      const capped = childIds.slice(0, 50)
+
+      for (const childId of capped) {
+        peekNodes.push({
+          nodeId: childId,
+          id: childId,        // for SVG delegation datum.id lookup
+          parentId: level.parentId,
+          depth: level.depth,
+          isTransient: level.isTransient,
+          node: stateNodes.find(n => n.id === childId),
+        })
+      }
+      for (const e of levelEdges) {
+        const tgt = e.source === level.parentId ? e.target : e.source
+        if (capped.includes(tgt)) {
+          peekEdges.push({ source: e.source, target: e.target, depth: level.depth })
+        }
+      }
+
+      // Cross-layer edges: connect peek children to base nodes (focus + 1st/2nd layer)
+      const crossLayerSeen = new Set<string>()
+      for (const pn of peekNodes) {
+        for (const e of stateEdges) {
+          if (stShowExternal || !e.isExternal) {
+            const isSrcPeek = pn.nodeId === e.source
+            const isTgtPeek = pn.nodeId === e.target
+            if (isSrcPeek && baseNodeIds.has(e.target)) {
+              const key = `${e.source}:${e.target}:${pn.depth}`
+              if (!crossLayerSeen.has(key)) {
+                crossLayerSeen.add(key)
+                peekEdges.push({ source: e.source, target: e.target, depth: pn.depth })
+              }
+            } else if (isTgtPeek && baseNodeIds.has(e.source)) {
+              const key = `${e.source}:${e.target}:${pn.depth}`
+              if (!crossLayerSeen.has(key)) {
+                crossLayerSeen.add(key)
+                peekEdges.push({ source: e.source, target: e.target, depth: pn.depth })
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (peekNodes.length === 0) {
+      g.selectAll('.peek-group').remove()
+      g.selectAll('.peek-links-group').remove()
       return
     }
-    loadEdgesForNode(focusNode)
-      .then(() => {
-        if (useGraphStore.getState().selectedNodeId !== currentFocusId) return
-        setIsLoadingEdges(false)
+
+    // Step 4: Blur/opacity mapping by depth
+    const depthStyle = (depth: number): { opacity: number; filter: string } => {
+      switch (depth) {
+        case 1: return { opacity: 0.7, filter: 'url(#peek-blur-1)' }
+        case 2: return { opacity: 0.5, filter: 'url(#peek-blur-2)' }
+        default: return { opacity: 0.35, filter: 'url(#peek-blur-3)' }
+      }
+    }
+
+    // Step 5: Determine deepest persistent parent (for interactive gate)
+    const deepestPersistentParent = sPeekStack.length > 0 ? sPeekStack[sPeekStack.length - 1] : null
+
+    // Step 6: D3 join for peek nodes
+    const peekNodeContainer = g.selectAll<SVGGElement, unknown>('.peek-group').data([null])
+      .join('g').attr('class', 'peek-group')
+
+    const peekNodeJoin = peekNodeContainer.selectAll<SVGGElement, typeof peekNodes[0]>('.peek-node')
+      .data(peekNodes, d => d.nodeId)
+
+    peekNodeJoin.exit().remove()
+
+    const peekNodeEnter = peekNodeJoin.enter().append('g').attr('class', 'peek-node')
+    peekNodeEnter.append('circle')
+    peekNodeEnter.append('text')
+
+    const peekNodeMerge = peekNodeEnter.merge(peekNodeJoin)
+
+    // Position around parent in a semi-circular fan
+    peekNodeMerge.each(function(d) {
+      const parentPos = posMap.get(d.parentId)
+      if (!parentPos) return
+      const el = d3.select(this)
+      // Group siblings by parent
+      const siblings = peekNodes.filter(n => n.parentId === d.parentId)
+      const idx = siblings.indexOf(d)
+      const total = siblings.length
+      // Semi-circle: -90° to +90° (callers left, callees right would need edge direction — simplified)
+      const startAngle = -Math.PI / 2
+      const endAngle = Math.PI / 2
+      const angle = total <= 1 ? 0 : startAngle + (idx / Math.max(total - 1, 1)) * (endAngle - startAngle)
+      const radius = 40 + d.depth * 5
+      const relX = radius * Math.cos(angle)
+      const relY = radius * Math.sin(angle)
+      el.attr('transform', `translate(${parentPos.x + relX}, ${parentPos.y + relY})`)
+      // Store relative offset for drag-following
+      el.attr('data-parent-id', d.parentId)
+      el.attr('data-node-id', d.nodeId)
+      el.attr('data-offset-x', relX)
+      el.attr('data-offset-y', relY)
+    })
+
+    // Styling
+    peekNodeMerge.select('circle')
+      .attr('r', 4)
+      .attr('fill', '#999')
+      .attr('stroke', '#bbb')
+      .attr('stroke-width', 0.8)
+
+    peekNodeMerge.select('text')
+      .text(d => d.node?.name ?? d.nodeId.slice(0, 20))
+      .attr('font-size', 8)
+      .attr('dx', 5)
+      .attr('dy', 2)
+      .attr('fill', '#bbb')
+
+    // Apply depth-based blur and opacity
+    peekNodeMerge.each(function(d) {
+      const el = d3.select(this)
+      const style = depthStyle(d.depth)
+      el.select('circle')
+        .style('opacity', style.opacity)
+        .style('filter', style.filter)
+      el.select('text')
+        .style('opacity', style.opacity)
+    })
+
+    // Interactive gate: only deepest persistent level children are interactive
+    peekNodeMerge.style('pointer-events', d => {
+      if (d.isTransient) return 'none'
+      if (deepestPersistentParent && d.parentId === deepestPersistentParent) return 'auto'
+      return 'none'
+    })
+
+    // Step 7: D3 join for peek edges
+    const peekLinkContainer = g.selectAll<SVGGElement, unknown>('.peek-links-group').data([null])
+      .join('g').attr('class', 'peek-links-group')
+
+    const peekEdgeJoin = peekLinkContainer.selectAll<SVGLineElement, typeof peekEdges[0]>('.peek-edge')
+      .data(peekEdges, d => `${d.source}:${d.target}:${d.depth}`)
+
+    peekEdgeJoin.exit().remove()
+
+    const peekEdgeEnter = peekEdgeJoin.enter().append('line').attr('class', 'peek-edge')
+
+    const peekEdgeMerge = peekEdgeEnter.merge(peekEdgeJoin)
+
+    peekEdgeMerge.each(function(d) {
+      function getPeekPos(nodeId: string): {x: number; y: number} | null {
+        // If this node has a .peek-node element, compute its rendered position
+        const peekEl = g.select(`.peek-node[data-node-id="${nodeId}"]`)
+        if (!peekEl.empty()) {
+          const parentId = peekEl.attr('data-parent-id')
+          if (parentId) {
+            const parentPos = posMap.get(parentId)
+            if (parentPos) {
+              const ox = parseFloat(peekEl.attr('data-offset-x') ?? '0')
+              const oy = parseFloat(peekEl.attr('data-offset-y') ?? '0')
+              return { x: parentPos.x + ox, y: parentPos.y + oy }
+            }
+          }
+        }
+        // Fall back to main graph position
+        const mainPos = posMap.get(nodeId)
+        return mainPos ?? null
+      }
+
+      const srcPos = getPeekPos(d.source)
+      const tgtPos = getPeekPos(d.target)
+      if (!srcPos || !tgtPos) return
+
+      const shortTgt = shortenTarget(srcPos.x, srcPos.y, tgtPos.x, tgtPos.y, GAP_PEEK)
+      const el = d3.select(this)
+      el.attr('x1', srcPos.x)
+        .attr('y1', srcPos.y)
+        .attr('x2', shortTgt.x)
+        .attr('y2', shortTgt.y)
+        .attr('data-source', d.source)
+        .attr('data-target', d.target)
+    })
+
+    peekEdgeMerge
+      .attr('stroke', '#aaa')
+      .attr('stroke-width', 0.5)
+      .attr('stroke-dasharray', '3,2')
+      .each(function(d) {
+        const style = depthStyle(d.depth)
+        d3.select(this).style('opacity', style.opacity * 0.7)
       })
-      .catch((err: unknown) => {
-        if (useGraphStore.getState().selectedNodeId !== currentFocusId) return
-        setEdgeError(err instanceof Error ? err.message : String(err))
-        setIsLoadingEdges(false)
-      })
-  }, [loadEdgesForNode])
+      .attr('marker-end', 'url(#peek-arrow)')
+
+    // Cleanup function
+    return () => {
+      g.selectAll('.peek-group').remove()
+      g.selectAll('.peek-links-group').remove()
+    }
+  }, [peekStack, transientPeekNodeId, analysisStatus, focusNodeId, nodes, edges, showExternal])
+
+  // ── Effect: Clear peeks when focus changes (left panel navigation bypasses click handler) ──
+  useEffect(() => {
+    if (isFirstFocusRef.current) {
+      isFirstFocusRef.current = false
+      return
+    }
+    if (!focusNodeId) return
+    clearAllPeeks()
+  }, [focusNodeId, clearAllPeeks])
 
   return (
     <div style={{ position: 'relative', width, height }}>
@@ -1157,8 +1617,8 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         <div
           style={{
             position: 'absolute',
-            left: Math.max(0, Math.min(tooltipPos.x, width - 420)),
-            top: Math.max(0, Math.min(tooltipPos.y, height - 100)),
+            left: tooltipPos.x,
+            top: tooltipPos.y,
             zIndex: 1000,
             maxWidth: 400,
             maxHeight: 400,
@@ -1206,6 +1666,7 @@ const GraphCanvas: React.FC<GraphCanvasProps> = ({ width, height, focusNodeId, o
         edgeCount={overlayEdgeCount}
         focusNodeName={focusNodeName}
         onRetry={handleRetry}
+        loadingMessage={edgeLoadingMessage}
       />
 
       {analysisStatus === 'ready' && focusNodeId && (

@@ -23,6 +23,13 @@ export interface GraphState {
   showExternal: boolean
   fileFilter: string | null
 
+  // Peek state (recursive long-press / right-click)
+  peekStack: string[]                    // right-clicked nodes (persistent peeks)
+  transientPeekNodeId: string | null    // long-pressed node (temporary peek)
+
+  // Recursive edge loading tracking
+  loadedNodeIds: string[]
+
   // Actions
   setGraphData: (data: { nodes: FunctionNode[]; edges: CallEdge[]; stats: CallGraphData['stats'] }) => void
   addEdges: (edges: CallEdge[]) => void
@@ -43,6 +50,12 @@ export interface GraphState {
   setShowExternal: (value: boolean) => void
   toggleShowExternal: () => void
   setFileFilter: (path: string | null) => void
+  pushPeek: (nodeId: string) => void
+  popToPeek: (nodeId: string) => void
+  setTransientPeekNode: (nodeId: string | null) => void
+  clearAllPeeks: () => void
+  markNodesLoaded: (ids: string[]) => void
+  clearLoadedNodes: () => void
   clearGraph: () => void
   reset: () => void
 }
@@ -65,6 +78,9 @@ const initialState = {
   analysisStatus: 'idle' as const,
   showExternal: false,
   fileFilter: null,
+  peekStack: [] as string[],
+  transientPeekNodeId: null,
+  loadedNodeIds: [] as string[],
 }
 
 export const useGraphStore = create<GraphState>((set, get) => ({
@@ -207,6 +223,35 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     fileFilter: path,
   }),
 
+  pushPeek: (nodeId) => set((state) => {
+    if (state.peekStack.includes(nodeId)) return state  // already in stack
+    return { peekStack: [...state.peekStack, nodeId] }
+  }),
+
+  popToPeek: (nodeId) => set((state) => {
+    const idx = state.peekStack.indexOf(nodeId)
+    if (idx === -1) return state
+    // Remove nodeId and all deeper entries
+    return { peekStack: state.peekStack.slice(0, idx) }
+  }),
+
+  setTransientPeekNode: (nodeId) => set({
+    transientPeekNodeId: nodeId,
+  }),
+
+  clearAllPeeks: () => set({
+    peekStack: [],
+    transientPeekNodeId: null,
+  }),
+
+  markNodesLoaded: (ids) => set((state) => ({
+    loadedNodeIds: [...new Set([...state.loadedNodeIds, ...ids])],
+  })),
+
+  clearLoadedNodes: () => set({
+    loadedNodeIds: [],
+  }),
+
   clearGraph: () => set({
     nodes: [],
     edges: [],
@@ -217,9 +262,12 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     highlightedNodeIds: [],
     searchResults: [],
     showExternal: false,
+    peekStack: [],
+    transientPeekNodeId: null,
     fileFilter: null,
     analysisStatus: 'idle',
     error: null,
+    loadedNodeIds: [],
   }),
 
   reset: () => set(initialState),
@@ -255,4 +303,10 @@ export const selectTopCalled = (state: GraphState): Array<{ name: string; count:
 
 export const selectTopCallers = (state: GraphState): Array<{ name: string; count: number }> => {
   return state.stats?.topCallers ?? []
+}
+
+export const selectVisiblePeekNodeIds = (state: GraphState): Set<string> => {
+  const ids = new Set(state.peekStack)
+  if (state.transientPeekNodeId) ids.add(state.transientPeekNodeId)
+  return ids
 }
