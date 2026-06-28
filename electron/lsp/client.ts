@@ -354,10 +354,8 @@ export class LSPClient {
       return cached
     }
 
-    const [incoming, outgoing] = await Promise.all([
-      this.getIncomingCalls(item),
-      this.getOutgoingCalls(item),
-    ])
+    const incoming = await this.getIncomingCalls(item)
+    const outgoing = await this.getOutgoingCalls(item)
 
     const result = { incoming, outgoing }
     this.callCache.set(cacheKey, result)

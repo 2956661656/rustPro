@@ -249,8 +249,34 @@ export class GraphBuilder {
       }
 
       const item = items[0]
-      const hierarchy = await this.client.getCallHierarchy(item)
-      console.log(`[GraphBuilder] getCallHierarchy returned ${hierarchy.incoming.length} incoming, ${hierarchy.outgoing.length} outgoing`)
+
+      // Retry loop for getCallHierarchy (getIncomingCalls + getOutgoingCalls)
+      // These can also get "content modified" errors from rust-analyzer
+      let hierarchy: { incoming: CallHierarchyIncomingCall[]; outgoing: CallHierarchyOutgoingCall[] } | null = null
+      let hierarchySuccess = false
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          hierarchy = await this.client.getCallHierarchy(item)
+          console.log(`[GraphBuilder] getCallHierarchy returned ${hierarchy.incoming.length} incoming, ${hierarchy.outgoing.length} outgoing (attempt ${attempt}/${MAX_RETRIES})`)
+          hierarchySuccess = true
+          break
+        } catch (err) {
+          const errStr = String(err)
+          if (errStr.includes('content modified') && attempt < MAX_RETRIES) {
+            console.log(`[GraphBuilder] getCallHierarchy content modified (attempt ${attempt}/${MAX_RETRIES}), retrying in ${RETRY_DELAY_MS}ms...`)
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
+          } else {
+            console.error(`[GraphBuilder] getCallHierarchy FAILED after ${attempt} attempts: ${err}`)
+            return { incoming: [], outgoing: [], newNodes: [] }
+          }
+        }
+      }
+
+      if (!hierarchySuccess || !hierarchy) {
+        console.warn(`[GraphBuilder] getCallHierarchy failed after ${MAX_RETRIES} attempts`)
+        return { incoming: [], outgoing: [], newNodes: [] }
+      }
 
       const incoming: CallEdge[] = hierarchy.incoming
         .map(call => ({
