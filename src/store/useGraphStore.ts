@@ -11,6 +11,7 @@ export interface GraphState {
   selectedNodeId: string | null
   highlightedNodeIds: string[]
   focusHistory: string[]
+  forwardHistory: string[]
   searchQuery: string
   searchResults: FunctionNode[]
   isLoading: boolean
@@ -29,6 +30,7 @@ export interface GraphState {
   setSelectedNode: (nodeId: string | null) => void
   focusNode: (id: string) => void
   goBack: () => void
+  goForward: () => void
   toggleHighlightNode: (nodeId: string) => void
   setHighlightedNodes: (nodeIds: string[]) => void
   clearHighlights: () => void
@@ -52,6 +54,7 @@ const initialState = {
   selectedNodeId: null,
   highlightedNodeIds: [],
   focusHistory: [] as string[],
+  forwardHistory: [] as string[],
   searchQuery: '',
   searchResults: [],
   isLoading: false,
@@ -108,6 +111,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       return {
         selectedNodeId: id,
         focusHistory: [...state.focusHistory, oldId],
+        forwardHistory: [],
       }
     }
     return { selectedNodeId: id }
@@ -124,6 +128,26 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     return {
       selectedNodeId: popped,
       focusHistory: history,
+      forwardHistory: state.selectedNodeId !== null
+        ? [...state.forwardHistory, state.selectedNodeId]
+        : state.forwardHistory,
+    }
+  }),
+
+  goForward: () => set((state) => {
+    if (state.forwardHistory.length === 0) {
+      console.log('[Store] goForward: no forward history')
+      return {}
+    }
+    const forward = [...state.forwardHistory]
+    const popped = forward.pop()!
+    console.log(`[Store] goForward to ${popped}`)
+    return {
+      selectedNodeId: popped,
+      forwardHistory: forward,
+      focusHistory: state.selectedNodeId !== null
+        ? [...state.focusHistory, state.selectedNodeId]
+        : state.focusHistory,
     }
   }),
 
@@ -189,6 +213,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     stats: null,
     selectedNodeId: null,
     focusHistory: [],
+    forwardHistory: [],
     highlightedNodeIds: [],
     searchResults: [],
     showExternal: false,

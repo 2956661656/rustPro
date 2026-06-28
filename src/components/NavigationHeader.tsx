@@ -6,6 +6,8 @@ const NavigationHeader: React.FC = () => {
   const nodes = useGraphStore(s => s.nodes)
   const focusHistory = useGraphStore(s => s.focusHistory)
   const goBack = useGraphStore(s => s.goBack)
+  const forwardHistory = useGraphStore(s => s.forwardHistory)
+  const goForward = useGraphStore(s => s.goForward)
 
   const focusNode = nodes.find(n => n.id === selectedNodeId)
 
@@ -21,6 +23,14 @@ const NavigationHeader: React.FC = () => {
         aria-label="Go back"
       >
         ←
+      </button>
+      <button
+        className="nav-back-btn nav-forward-btn"
+        disabled={forwardHistory.length === 0}
+        onClick={goForward}
+        aria-label="Go forward"
+      >
+        →
       </button>
       <span className="nav-breadcrumb">
         {focusNode.module}
