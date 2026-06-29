@@ -5,6 +5,11 @@
 基于 rust-analyzer LSP 的 Rust 项目调用图可视化分析工具。使用 Electron + React + D3.js v7 构建，帮助开发者快速理解 Rust 代码库中的函数调用关系。
 在与 Agent 共同开发时格外有用。
 
+## 运行截图
+[![longshot2026062918411795908c228ee9da64.th.png](https://www.imageoss.com/images/2026/06/29/longshot2026062918411795908c228ee9da64.th.png)](https://www.imageoss.com/image/CvNZpT)
+
+[![longshot20260629184419b0aae3c5ebee6d6e.th.png](https://www.imageoss.com/images/2026/06/29/longshot20260629184419b0aae3c5ebee6d6e.th.png)](https://www.imageoss.com/image/CvNDa5)
+
 ## 功能特性
 
 - **🔍 项目分析** —— 通过 rust-analyzer LSP 自动发现项目中的所有函数、方法，构建完整的调用图

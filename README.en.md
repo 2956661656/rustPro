@@ -4,6 +4,11 @@
 
 A visual call graph analysis tool for Rust projects based on rust-analyzer LSP. Built with Electron + React + D3.js v7, it helps developers quickly understand function call relationships in Rust codebases. Especially useful when collaborating with AI agents.
 
+## Screenshot
+[![longshot2026062918411795908c228ee9da64.th.png](https://www.imageoss.com/images/2026/06/29/longshot2026062918411795908c228ee9da64.th.png)](https://www.imageoss.com/image/CvNZpT)
+
+[![longshot20260629184419b0aae3c5ebee6d6e.th.png](https://www.imageoss.com/images/2026/06/29/longshot20260629184419b0aae3c5ebee6d6e.th.png)](https://www.imageoss.com/image/CvNDa5)
+
 ## Features
 
 - **🔍 Project Analysis** — Automatically discovers all functions and methods in the project via rust-analyzer LSP, building a complete call graph
